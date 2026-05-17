@@ -24,6 +24,9 @@ interface StoreState {
   setCachedItems: (items: CanvasItem[]) => void;
   showGrid: boolean;
   setShowGrid: (show: boolean) => void;
+  undoStack: CanvasItem[][];
+  pushUndo: (items: CanvasItem[]) => void;
+  popUndo: () => CanvasItem[] | undefined;
 }
 
 const defaultTheme: Theme = {
@@ -50,10 +53,10 @@ export const useStore = create<StoreState>()(
       setPosition: (position) => set({ position }),
       addItem: (item) => set((state) => ({ items: [...state.items, item] })),
       updateItem: (id, updates) => set((state) => ({
-        items: state.items.map((i) => (i.id === id ? { ...i, ...updates } : i))
+        items: state.items.map((i) => (i._id === id ? { ...i, ...updates } : i))
       })),
       deleteItems: (ids) => set((state) => ({
-        items: state.items.filter((i) => !ids.includes(i.id))
+        items: state.items.filter((i) => !ids.includes(i._id))
       })),
       setSelection: (ids) => set({ selectedItemIds: ids }),
       setTheme: (theme) => set({ theme }),
@@ -62,6 +65,18 @@ export const useStore = create<StoreState>()(
       setCachedItems: (items) => set({ cachedItems: items }),
       showGrid: false,
       setShowGrid: (show) => set({ showGrid: show }),
+      undoStack: [],
+      pushUndo: (items) => set((state) => ({ undoStack: [...state.undoStack.slice(-30), [...items]] })),
+      popUndo: () => {
+        let prev: CanvasItem[] | undefined;
+        set((state) => {
+          if (state.undoStack.length === 0) return {};
+          const stack = [...state.undoStack];
+          prev = stack.pop();
+          return { undoStack: stack };
+        });
+        return prev;
+      },
     }),
     {
       name: 'clipboard-storage',

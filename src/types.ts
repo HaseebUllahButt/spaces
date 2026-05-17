@@ -1,7 +1,10 @@
+import type { Id } from "../convex/_generated/dataModel";
+
 export type ItemType = 'text' | 'image';
 
 export interface CanvasItem {
-  id: string;
+  _id: Id<"items">;
+  _creationTime: number;
   type: ItemType;
   x: number;
   y: number;

@@ -3,7 +3,7 @@ import { v } from "convex/values";
 
 export default defineSchema({
   items: defineTable({
-    type: v.string(), // 'text' | 'image'
+    type: v.union(v.literal('text'), v.literal('image')), // 'text' | 'image'
     x: v.number(),
     y: v.number(),
     width: v.optional(v.number()),

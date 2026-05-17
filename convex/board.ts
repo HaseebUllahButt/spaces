@@ -14,7 +14,7 @@ export const getItems = query({
 export const saveItem = mutation({
   args: {
     id: v.optional(v.id("items")),
-    type: v.string(),
+    type: v.union(v.literal('text'), v.literal('image')),
     x: v.number(),
     y: v.number(),
     width: v.optional(v.number()),
