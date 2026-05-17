@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useRef } from 'react';
 import { Stage, Layer, Text as KonvaText, Rect, Transformer } from 'react-konva';
 import jsPDF from 'jspdf';
 import { MousePointer2, Type, LayoutGrid, FileDown, SlidersHorizontal } from 'lucide-react';
@@ -10,18 +10,59 @@ import { api } from '../convex/_generated/api';
 import type { Id } from '../convex/_generated/dataModel';
 
 const EMPTY_ARRAY: any[] = [];
+const DEFAULT_TEXT_WIDTH = 360;
+const DEFAULT_TEXT_HEIGHT = 56;
+
+const textMeasureCanvas = document.createElement('canvas');
+
+const measureTextBox = (content: string, fontFamily: string, fontSize: number) => {
+  const context = textMeasureCanvas.getContext('2d');
+  const lines = content.length > 0 ? content.split('\n') : [''];
+
+  if (!context) {
+    return { width: DEFAULT_TEXT_WIDTH, height: DEFAULT_TEXT_HEIGHT };
+  }
+
+  context.font = `${fontSize}px ${fontFamily}`;
+
+  let maxLineWidth = 0;
+  for (const line of lines) {
+    maxLineWidth = Math.max(maxLineWidth, context.measureText(line).width);
+  }
+
+  const lineHeight = fontSize * 1.2;
+  const width = content.length > 0 ? Math.ceil(maxLineWidth + fontSize * 0.5) : DEFAULT_TEXT_WIDTH;
+  const height = content.length > 0 ? Math.ceil(lines.length * lineHeight) : DEFAULT_TEXT_HEIGHT;
+
+  return { width, height };
+};
 
 const App: React.FC = () => {
   const { theme, mode, setMode, scale, setScale, position, setPosition, cachedItems, setCachedItems, showGrid, setShowGrid, pushUndo, popUndo } = useStore();
 
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
+  const [menuCollapsed, setMenuCollapsed] = React.useState(false);
   const [editingText, setEditingText] = React.useState<{ _id?: string; x: number; y: number; content: string } | null>(null);
 
   const trRef = useRef<any>(null);
   const stageRef = useRef<any>(null);
+  const textEditorRef = useRef<HTMLTextAreaElement | null>(null);
   // Tracks locally-edited content so stale Convex subscription data doesn't overwrite it
   const localUpdates = useRef<Map<string, Partial<any>>>(new Map());
+
+  const resizeTextEditor = (textarea = textEditorRef.current, value = editingText?.content ?? '') => {
+    if (!textarea) return;
+    if (!editingText) return;
+
+    const metrics = measureTextBox(value, theme.fontFamily, 20);
+    textarea.style.width = `${metrics.width * scale}px`;
+    textarea.style.height = `${metrics.height * scale}px`;
+  };
+
+  useLayoutEffect(() => {
+    if (editingText) resizeTextEditor();
+  }, [editingText?.content, editingText?.x, editingText?.y, scale, theme.fontFamily]);
 
   const boardId = 'main';
   const dbItems = useQuery(api.board.getItems, { boardId });
@@ -116,6 +157,7 @@ const App: React.FC = () => {
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
       if (e.key.toLowerCase() === 's') setMode('select');
       if (e.key.toLowerCase() === 't') setMode('text');
+      if (e.key.toLowerCase() === 'm') setMenuCollapsed(value => !value);
       if (e.key.toLowerCase() === 'g') setShowGrid(!showGrid);
       if (e.key === 'Escape') { setShowSettings(false); setSelectedId(null); }
       if ((e.key === 'Backspace' || e.key === 'Delete') && selectedId) {
@@ -195,22 +237,23 @@ const App: React.FC = () => {
 
   const handleTextBlur = () => {
     if (!editingText) return;
-    const content = editingText.content.trim();
+    const content = editingText.content;
     const isTemp = editingText._id && String(editingText._id).startsWith('temp-');
     const isReal = editingText._id && !isTemp;
-    if (content) {
+    const metrics = measureTextBox(content, theme.fontFamily, 20);
+    if (content.trim().length > 0) {
       if (isReal) {
         // Editing existing real item — record locally so stale dbItems can't overwrite
         pushUndo(items);
         localUpdates.current.set(editingText._id!, { content });
-        setCachedItems(items.map(i => i._id === editingText._id ? { ...i, content } : i));
-        saveItemDb({ id: editingText._id as Id<'items'>, type: 'text', content, boardId, x: editingText.x, y: editingText.y });
+        setCachedItems(items.map(i => i._id === editingText._id ? { ...i, content, width: Math.max(i.width || 0, metrics.width), height: Math.max(i.height || 0, metrics.height) } : i));
+        saveItemDb({ id: editingText._id as Id<'items'>, type: 'text', content, boardId, x: editingText.x, y: editingText.y, width: Math.max(items.find(i => i._id === editingText._id)?.width || 0, metrics.width), height: Math.max(items.find(i => i._id === editingText._id)?.height || 0, metrics.height) });
       } else {
         // New item (no _id or temp) — add optimistically
         const tempId = `temp-${Date.now()}` as Id<'items'>;
         pushUndo(items);
-        setCachedItems([...items.filter(i => i._id !== editingText._id), { _id: tempId, _creationTime: Date.now(), type: 'text', x: editingText.x, y: editingText.y, content, fontFamily: theme.fontFamily, color: theme.textColor }]);
-        saveItemDb({ type: 'text', x: editingText.x, y: editingText.y, content, fontFamily: theme.fontFamily, color: theme.textColor, boardId });
+        setCachedItems([...items.filter(i => i._id !== editingText._id), { _id: tempId, _creationTime: Date.now(), type: 'text', x: editingText.x, y: editingText.y, width: metrics.width, height: metrics.height, content, fontFamily: theme.fontFamily, color: theme.textColor }]);
+        saveItemDb({ type: 'text', x: editingText.x, y: editingText.y, width: metrics.width, height: metrics.height, content, fontFamily: theme.fontFamily, color: theme.textColor, boardId });
       }
     } else if (isReal) {
       // Cleared content on a real item → delete it
@@ -248,43 +291,73 @@ const App: React.FC = () => {
   const btnBase: React.CSSProperties = { border: 'none', cursor: 'pointer', borderRadius: '10px', transition: 'all 0.15s ease', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: theme.fontFamily };
   const toolBtn = (active: boolean): React.CSSProperties => ({ ...btnBase, gap: '6px', padding: '7px 13px', fontSize: '12px', fontWeight: 600, letterSpacing: '0.2px', backgroundColor: active ? theme.textColor : 'transparent', color: active ? theme.backgroundColor : theme.textColor });
   const iconBtn = (active = false): React.CSSProperties => ({ ...btnBase, padding: '8px', backgroundColor: active ? `${theme.textColor}15` : 'transparent', color: theme.textColor });
+  const menuShellStyle: React.CSSProperties = { position: 'fixed', bottom: 28, left: '50%', transform: 'translateX(-50%)', zIndex: 100, display: 'flex', alignItems: 'center', gap: '2px', padding: '5px', backgroundColor: `${theme.backgroundColor}EE`, backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)', border: `1px solid ${theme.textColor}18`, borderRadius: '16px', boxShadow: `0 8px 32px -4px ${theme.textColor}20` };
+  const editingMetrics = editingText ? measureTextBox(editingText.content, theme.fontFamily, 20) : null;
 
   return (
     <div style={{ width: '100vw', height: '100vh', backgroundColor: theme.backgroundColor, overflow: 'hidden', backgroundImage: `radial-gradient(${theme.textColor}18 1px, transparent 0)`, backgroundSize: '28px 28px', backgroundPosition: `${position.x % 28}px ${position.y % 28}px`, transition: 'background-color 0.4s ease', cursor: mode === 'text' ? 'crosshair' : 'default' }}>
 
       {/* ── Bottom Toolbar ── */}
-      <div style={{ position: 'fixed', bottom: 28, left: '50%', transform: 'translateX(-50%)', zIndex: 100, display: 'flex', alignItems: 'center', gap: '2px', padding: '5px', backgroundColor: `${theme.backgroundColor}EE`, backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)', border: `1px solid ${theme.textColor}18`, borderRadius: '16px', boxShadow: `0 8px 32px -4px ${theme.textColor}20` }}>
-        <button style={toolBtn(mode === 'select')} onClick={() => setMode('select')} title="Select · S">
-          <MousePointer2 size={13} /> Select
+      {menuCollapsed ? (
+        <button
+          style={{ ...menuShellStyle, minWidth: '84px', padding: '10px 14px', gap: '8px', cursor: 'pointer' }}
+          onClick={() => setMenuCollapsed(false)}
+          title="Expand menu · M"
+        >
+          <SlidersHorizontal size={15} />
+          <span style={{ fontSize: '12px', fontWeight: 700, color: theme.textColor, fontFamily: theme.fontFamily }}>Menu</span>
         </button>
-        <button style={toolBtn(mode === 'text')} onClick={() => setMode('text')} title="Text · T">
-          <Type size={13} /> Text
-        </button>
+      ) : (
+        <div style={menuShellStyle}>
+          <button style={toolBtn(mode === 'select')} onClick={() => setMode('select')} title="Select · S">
+            <MousePointer2 size={13} /> Select
+          </button>
+          <button style={toolBtn(mode === 'text')} onClick={() => setMode('text')} title="Text · T">
+            <Type size={13} /> Text
+          </button>
 
-        <div style={{ width: '1px', height: '18px', backgroundColor: `${theme.textColor}20`, margin: '0 4px' }} />
+          <div style={{ width: '1px', height: '18px', backgroundColor: `${theme.textColor}20`, margin: '0 4px' }} />
 
-        <button style={iconBtn(showGrid)} onClick={() => setShowGrid(!showGrid)} title="Grid · G"><LayoutGrid size={15} /></button>
-        <button style={iconBtn()} onClick={handleExportPDF} title="Export PDF"><FileDown size={15} /></button>
-        <button style={iconBtn(showSettings)} onClick={() => setShowSettings(!showSettings)} title="Settings"><SlidersHorizontal size={15} /></button>
+          <button style={iconBtn(showGrid)} onClick={() => setShowGrid(!showGrid)} title="Grid · G"><LayoutGrid size={15} /></button>
+          <button style={iconBtn()} onClick={handleExportPDF} title="Export PDF"><FileDown size={15} /></button>
+          <button style={iconBtn(showSettings)} onClick={() => setShowSettings(!showSettings)} title="Settings"><SlidersHorizontal size={15} /></button>
 
-        <div style={{ width: '1px', height: '18px', backgroundColor: `${theme.textColor}20`, margin: '0 4px' }} />
+          <div style={{ width: '1px', height: '18px', backgroundColor: `${theme.textColor}20`, margin: '0 4px' }} />
 
-        <span style={{ fontSize: '11px', fontWeight: 700, color: `${theme.textColor}50`, fontFamily: theme.fontFamily, padding: '0 6px', minWidth: '38px', textAlign: 'center', userSelect: 'none' }}>{zoomPct}%</span>
-      </div>
+          <span style={{ fontSize: '11px', fontWeight: 700, color: `${theme.textColor}50`, fontFamily: theme.fontFamily, padding: '0 6px', minWidth: '38px', textAlign: 'center', userSelect: 'none' }}>{zoomPct}%</span>
+        </div>
+      )}
 
       {/* ── Settings Panel ── */}
       <ThemePanel visible={showSettings} onExportPDF={handleExportPDF} showGrid={showGrid} onToggleGrid={() => setShowGrid(!showGrid)} />
 
       {/* ── Inline Text Editor ── */}
       {editingText && (
-        <textarea
-          autoFocus
-          style={{ position: 'absolute', top: editingText.y * scale + position.y, left: editingText.x * scale + position.x, background: 'transparent', border: 'none', color: theme.textColor, fontFamily: theme.fontFamily, fontSize: `${20 * scale}px`, outline: 'none', resize: 'none', overflow: 'hidden', zIndex: 50, minWidth: '200px', minHeight: '50px', lineHeight: 1.5 }}
-          value={editingText.content}
-          onChange={(e) => setEditingText({ ...editingText, content: e.target.value })}
-          onBlur={handleTextBlur}
-          onKeyDown={(e) => { if (e.key === 'Escape') e.currentTarget.blur(); }}
-        />
+        <>
+          <textarea
+            ref={textEditorRef}
+            autoFocus
+            wrap="off"
+            aria-hidden="true"
+            tabIndex={-1}
+            style={{ position: 'absolute', top: editingText.y * scale + position.y, left: editingText.x * scale + position.x, width: `${(editingMetrics?.width || DEFAULT_TEXT_WIDTH) * scale}px`, height: `${(editingMetrics?.height || DEFAULT_TEXT_HEIGHT) * scale}px`, opacity: 0, pointerEvents: 'none', border: 'none', padding: 0, margin: 0, resize: 'none', background: 'transparent', color: 'transparent', caretColor: 'transparent', outline: 'none', overflow: 'hidden', fontFamily: theme.fontFamily, fontSize: `${20 * scale}px`, lineHeight: 1.2, whiteSpace: 'pre', wordBreak: 'normal', overflowWrap: 'normal' }}
+            value={editingText.content}
+            onChange={(e) => {
+              const value = e.target.value;
+              setEditingText({ ...editingText, content: value });
+              resizeTextEditor(e.currentTarget, value);
+            }}
+            onInput={(e) => resizeTextEditor(e.currentTarget, e.currentTarget.value)}
+            onBlur={handleTextBlur}
+            onKeyDown={(e) => { if (e.key === 'Escape') e.currentTarget.blur(); }}
+          />
+
+          <div
+            style={{ position: 'absolute', top: editingText.y * scale + position.y, left: editingText.x * scale + position.x, width: `${(editingMetrics?.width || DEFAULT_TEXT_WIDTH) * scale}px`, height: `${(editingMetrics?.height || DEFAULT_TEXT_HEIGHT) * scale}px`, zIndex: 50, pointerEvents: 'none', border: `1px solid ${theme.textColor}33`, borderRadius: '6px', padding: 0, margin: 0, color: theme.textColor, fontFamily: theme.fontFamily, fontSize: `${20 * scale}px`, lineHeight: 1.2, whiteSpace: 'pre', wordBreak: 'normal', overflowWrap: 'normal', background: 'transparent', boxSizing: 'content-box' }}
+          >
+            {editingText.content || '\u200b'}
+          </div>
+        </>
       )}
 
       {/* ── Empty State ── */}
@@ -316,34 +389,61 @@ const App: React.FC = () => {
           )}
 
           {/* Items */}
-          {items.map((item) => (
-            <React.Fragment key={item._id}>
-              {item.type === 'text' ? (
-                // Hide the canvas text node while its textarea editor is open
-                editingText?._id === item._id ? null : (
-                <KonvaText
-                  id={item._id} x={item.x} y={item.y} text={item.content}
-                  width={item.width} height={item.height} fontSize={20}
-                  fontFamily={item.fontFamily || theme.fontFamily} fill={item.color || theme.textColor}
+          {items.map((item) => {
+            if (item.type === 'text') {
+              if (editingText?._id === item._id) return null;
+
+              const itemMetrics = measureTextBox(item.content, item.fontFamily || theme.fontFamily, 20);
+              const width = Math.max(item.width || 0, itemMetrics.width);
+              const height = Math.max(item.height || 0, itemMetrics.height);
+
+              return (
+                <React.Fragment key={item._id}>
+                  <KonvaText
+                    id={item._id}
+                    x={item.x}
+                    y={item.y}
+                    text={item.content}
+                    width={width}
+                    height={height}
+                    fontSize={20}
+                    lineHeight={1.2}
+                    fontFamily={item.fontFamily || theme.fontFamily}
+                    fill={item.color || theme.textColor}
+                    wrap="none"
+                    draggable={mode === 'select'}
+                    onPointerDown={() => itemPointerDown(item._id)}
+                    onDragEnd={(e: any) => itemDragEnd(e, item)}
+                    onTransformEnd={(e: any) => itemTransformEnd(e, item)}
+                    // FIX: double-click to edit — single click only selects
+                    onDblClick={() => {
+                      if (mode === 'select') {
+                        setSelectedId(null);
+                        setEditingText({ _id: item._id, x: item.x, y: item.y, content: item.content });
+                      }
+                    }}
+                  />
+                </React.Fragment>
+              );
+            }
+
+            return (
+              <React.Fragment key={item._id}>
+                <CanvasImage
+                  id={item._id}
+                  x={item.x}
+                  y={item.y}
+                  url={item.content}
+                  width={item.width}
+                  height={item.height}
                   draggable={mode === 'select'}
                   onPointerDown={() => itemPointerDown(item._id)}
                   onDragEnd={(e: any) => itemDragEnd(e, item)}
                   onTransformEnd={(e: any) => itemTransformEnd(e, item)}
-                  // FIX: double-click to edit — single click only selects
-                  onDblClick={() => { if (mode === 'select') setEditingText({ _id: item._id, x: item.x, y: item.y, content: item.content }); }}
                 />
-                )
-              ) : (
-                <CanvasImage
-                  id={item._id} x={item.x} y={item.y} url={item.content}
-                  width={item.width} height={item.height} draggable={mode === 'select'}
-                  onPointerDown={() => itemPointerDown(item._id)}
-                  onDragEnd={(e: any) => itemDragEnd(e, item)}
-                  onTransformEnd={(e: any) => itemTransformEnd(e, item)}
-                />
-              )}
-            </React.Fragment>
-          ))}
+              </React.Fragment>
+            );
+          })}
 
           {selectedId && <Transformer ref={trRef} boundBoxFunc={(oldBox, newBox) => (newBox.width < 5 || newBox.height < 5 ? oldBox : newBox)} />}
         </Layer>
