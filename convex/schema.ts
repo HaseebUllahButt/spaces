@@ -13,4 +13,21 @@ export default defineSchema({
     fontFamily: v.optional(v.string()),
     boardId: v.string(), // for multi-board support later, default 'main' for now
   }).index("by_boardId", ["boardId"]),
+
+  checkpoints: defineTable({
+    boardId: v.string(),
+    name: v.string(),
+    items: v.array(
+      v.object({
+        type: v.union(v.literal('text'), v.literal('image')),
+        x: v.number(),
+        y: v.number(),
+        width: v.optional(v.number()),
+        height: v.optional(v.number()),
+        content: v.string(),
+        color: v.optional(v.string()),
+        fontFamily: v.optional(v.string()),
+      })
+    ),
+  }).index("by_boardId", ["boardId"]),
 });

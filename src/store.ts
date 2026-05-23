@@ -25,8 +25,13 @@ interface StoreState {
   showGrid: boolean;
   setShowGrid: (show: boolean) => void;
   undoStack: CanvasItem[][];
+  redoStack: CanvasItem[][];
   pushUndo: (items: CanvasItem[]) => void;
-  popUndo: () => CanvasItem[] | undefined;
+  popUndo: (currentItems: CanvasItem[]) => CanvasItem[] | undefined;
+  popRedo: (currentItems: CanvasItem[]) => CanvasItem[] | undefined;
+  hasInteracted: boolean;
+  setHasInteracted: (interacted: boolean) => void;
+  updateHistoryIds: (oldId: string, newId: string) => void;
 }
 
 const defaultTheme: Theme = {
@@ -66,17 +71,47 @@ export const useStore = create<StoreState>()(
       showGrid: false,
       setShowGrid: (show) => set({ showGrid: show }),
       undoStack: [],
-      pushUndo: (items) => set((state) => ({ undoStack: [...state.undoStack.slice(-30), [...items]] })),
-      popUndo: () => {
+      redoStack: [],
+      pushUndo: (items) => set((state) => ({ 
+        undoStack: [...state.undoStack.slice(-20), [...items]],
+        redoStack: [], // Clear redo history on a new action
+      })),
+      popUndo: (currentItems) => {
         let prev: CanvasItem[] | undefined;
         set((state) => {
           if (state.undoStack.length === 0) return {};
           const stack = [...state.undoStack];
           prev = stack.pop();
-          return { undoStack: stack };
+          return { 
+            undoStack: stack,
+            redoStack: [...state.redoStack.slice(-20), [...currentItems]],
+          };
         });
         return prev;
       },
+      popRedo: (currentItems) => {
+        let next: CanvasItem[] | undefined;
+        set((state) => {
+          if (state.redoStack.length === 0) return {};
+          const stack = [...state.redoStack];
+          next = stack.pop();
+          return {
+            redoStack: stack,
+            undoStack: [...state.undoStack.slice(-20), [...currentItems]],
+          };
+        });
+        return next;
+      },
+      hasInteracted: false,
+      setHasInteracted: (interacted) => set({ hasInteracted: interacted }),
+      updateHistoryIds: (oldId, newId) => set((state) => {
+        const replace = (list: CanvasItem[]) => list.map(item => item._id === oldId ? { ...item, _id: newId as any } : item);
+        return {
+          cachedItems: replace(state.cachedItems),
+          undoStack: state.undoStack.map(replace),
+          redoStack: state.redoStack.map(replace),
+        };
+      }),
     }),
     {
       name: 'clipboard-storage',
@@ -85,7 +120,10 @@ export const useStore = create<StoreState>()(
         position: state.position, 
         scale: state.scale,
         cachedItems: state.cachedItems,
-        showGrid: state.showGrid
+        showGrid: state.showGrid,
+        hasInteracted: state.hasInteracted,
+        undoStack: state.undoStack,
+        redoStack: state.redoStack,
       }),
     }
   )

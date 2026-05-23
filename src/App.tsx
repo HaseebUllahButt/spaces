@@ -1,10 +1,11 @@
 import React, { useEffect, useLayoutEffect, useRef } from 'react';
 import { Stage, Layer, Text as KonvaText, Rect, Transformer } from 'react-konva';
 import jsPDF from 'jspdf';
-import { MousePointer2, Type, LayoutGrid, FileDown, SlidersHorizontal } from 'lucide-react';
+import { MousePointer2, Type, LayoutGrid, FileDown, SlidersHorizontal, GitCommitHorizontal } from 'lucide-react';
 import { useStore } from './store';
 import CanvasImage from './components/CanvasImage';
 import ThemePanel from './components/ThemePanel';
+import CheckpointPanel from './components/CheckpointPanel';
 import { useQuery, useMutation } from 'convex/react';
 import { api } from '../convex/_generated/api';
 import type { Id } from '../convex/_generated/dataModel';
@@ -38,10 +39,11 @@ const measureTextBox = (content: string, fontFamily: string, fontSize: number) =
 };
 
 const App: React.FC = () => {
-  const { theme, mode, setMode, scale, setScale, position, setPosition, cachedItems, setCachedItems, showGrid, setShowGrid, pushUndo, popUndo } = useStore();
+  const { theme, mode, setMode, scale, setScale, position, setPosition, cachedItems, setCachedItems, showGrid, setShowGrid, pushUndo, popUndo, popRedo, hasInteracted, setHasInteracted, updateHistoryIds } = useStore();
 
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
+  const [showCheckpoints, setShowCheckpoints] = React.useState(false);
   const [menuCollapsed, setMenuCollapsed] = React.useState(false);
   const [editingText, setEditingText] = React.useState<{ _id?: string; x: number; y: number; content: string } | null>(null);
 
@@ -106,12 +108,14 @@ const App: React.FC = () => {
     const newScale = Math.min(Math.max(e.evt.deltaY < 0 ? oldScale * 1.08 : oldScale / 1.08, 0.1), 5);
     setScale(newScale);
     setPosition({ x: pointer.x - mousePointTo.x * newScale, y: pointer.y - mousePointTo.y * newScale });
+    if (!hasInteracted) setHasInteracted(true);
   };
 
   const handleStageClick = (e: any) => {
     if (e.target !== stageRef.current) return;
     setShowSettings(false);
     setSelectedId(null);
+    if (!hasInteracted) setHasInteracted(true);
     if (mode === 'text') {
       const stage = stageRef.current;
       const pointer = stage.getPointerPosition();
@@ -120,11 +124,14 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      // If user is editing text, let the browser handle its own Undo/Redo/events
+      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+
       // Allow Ctrl+Z anywhere
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 'z') {
         e.preventDefault();
-        const prev = popUndo();
+        const prev = popUndo(items);
         if (prev) {
           // Reconcile with Convex: find what changed
           const currentReal = items.filter(i => !String(i._id).startsWith('temp-'));
@@ -135,10 +142,22 @@ const App: React.FC = () => {
           for (const item of currentReal) {
             if (!prevIds.has(item._id)) deleteItemDb({ id: item._id as Id<'items'> });
           }
-          // Re-create items that were deleted (they get new IDs, that's fine)
+          // Re-create items that were deleted (mapping old IDs to new database IDs)
+          const idMap = new Map<string, string>();
           for (const item of prevReal) {
             if (!currentIds.has(item._id)) {
-              saveItemDb({ type: item.type, x: item.x, y: item.y, content: item.content, color: item.color, fontFamily: item.fontFamily, boardId });
+              const newId = await saveItemDb({
+                type: item.type,
+                x: item.x,
+                y: item.y,
+                width: item.width,
+                height: item.height,
+                content: item.content,
+                color: item.color,
+                fontFamily: item.fontFamily,
+                boardId
+              });
+              idMap.set(item._id, newId);
             }
           }
           // Patch items that moved or changed
@@ -146,15 +165,80 @@ const App: React.FC = () => {
             if (currentIds.has(item._id)) {
               const cur = currentReal.find(i => i._id === item._id);
               if (cur && (cur.x !== item.x || cur.y !== item.y || cur.content !== item.content || cur.width !== item.width || cur.height !== item.height)) {
-                saveItemDb({ id: item._id as Id<'items'>, type: item.type, x: item.x, y: item.y, content: item.content, color: item.color, fontFamily: item.fontFamily, boardId });
+                saveItemDb({ id: item._id as Id<'items'>, type: item.type, x: item.x, y: item.y, content: item.content, color: item.color, fontFamily: item.fontFamily, width: item.width, height: item.height, boardId });
               }
             }
           }
-          setCachedItems(prev.filter(i => !String(i._id).startsWith('temp-')));
+          // Apply ID mappings to popped state so it matches what was stored on the server
+          const mappedPrev = prev.map(item => {
+            const mappedId = idMap.get(item._id);
+            return mappedId ? { ...item, _id: mappedId as any } : item;
+          });
+          setCachedItems(mappedPrev.filter(i => !String(i._id).startsWith('temp-')));
+          // Update the history stacks in the store with the new IDs
+          idMap.forEach((newId, oldId) => {
+            updateHistoryIds(oldId, newId);
+          });
         }
         return;
       }
-      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+      
+      // Allow Redo: Ctrl+Y / Cmd+Y or Ctrl+Shift+Z / Cmd+Shift+Z
+      const isRedo = ((e.ctrlKey || e.metaKey) && e.key === 'y') || ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'z');
+      if (isRedo) {
+        e.preventDefault();
+        const next = popRedo(items);
+        if (next) {
+          // Reconcile with Convex: find what changed
+          const currentReal = items.filter(i => !String(i._id).startsWith('temp-'));
+          const nextReal = next.filter(i => !String(i._id).startsWith('temp-'));
+          const nextIds = new Set(nextReal.map(i => i._id));
+          const currentIds = new Set(currentReal.map(i => i._id));
+          // Delete items that were added in the past state but not present in next
+          for (const item of currentReal) {
+            if (!nextIds.has(item._id)) deleteItemDb({ id: item._id as Id<'items'> });
+          }
+          // Re-create items that were deleted in current but exist in next (mapping old IDs to new database IDs)
+          const idMap = new Map<string, string>();
+          for (const item of nextReal) {
+            if (!currentIds.has(item._id)) {
+              const newId = await saveItemDb({
+                type: item.type,
+                x: item.x,
+                y: item.y,
+                width: item.width,
+                height: item.height,
+                content: item.content,
+                color: item.color,
+                fontFamily: item.fontFamily,
+                boardId
+              });
+              idMap.set(item._id, newId);
+            }
+          }
+          // Patch items that moved or changed
+          for (const item of nextReal) {
+            if (currentIds.has(item._id)) {
+              const cur = currentReal.find(i => i._id === item._id);
+              if (cur && (cur.x !== item.x || cur.y !== item.y || cur.content !== item.content || cur.width !== item.width || cur.height !== item.height)) {
+                saveItemDb({ id: item._id as Id<'items'>, type: item.type, x: item.x, y: item.y, content: item.content, color: item.color, fontFamily: item.fontFamily, width: item.width, height: item.height, boardId });
+              }
+            }
+          }
+          // Apply ID mappings to popped state so it matches what was stored on the server
+          const mappedNext = next.map(item => {
+            const mappedId = idMap.get(item._id);
+            return mappedId ? { ...item, _id: mappedId as any } : item;
+          });
+          setCachedItems(mappedNext.filter(i => !String(i._id).startsWith('temp-')));
+          // Update the history stacks in the store with the new IDs
+          idMap.forEach((newId, oldId) => {
+            updateHistoryIds(oldId, newId);
+          });
+        }
+        return;
+      }
+
       if (e.key.toLowerCase() === 's') setMode('select');
       if (e.key.toLowerCase() === 't') setMode('text');
       if (e.key.toLowerCase() === 'm') setMenuCollapsed(value => !value);
@@ -169,7 +253,7 @@ const App: React.FC = () => {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [setMode, selectedId, deleteItemDb, items, setCachedItems, showGrid, setShowGrid, pushUndo, popUndo, saveItemDb, boardId]);
+  }, [setMode, selectedId, deleteItemDb, items, setCachedItems, showGrid, setShowGrid, pushUndo, popUndo, popRedo, saveItemDb, boardId, updateHistoryIds]);
 
   const handleExportPDF = () => {
     if (items.length === 0) return alert('Board is empty!');
@@ -201,13 +285,18 @@ const App: React.FC = () => {
       const x = (pointer.x - stage.x()) / stage.scaleX();
       const y = (pointer.y - stage.y()) / stage.scaleY();
       const text = e.clipboardData?.getData('text');
-      if (text) { saveItemDb({ type: 'text', x, y, content: text, fontFamily: theme.fontFamily, color: theme.textColor, boardId }); return; }
+      if (text) {
+        if (!hasInteracted) setHasInteracted(true);
+        saveItemDb({ type: 'text', x, y, content: text, fontFamily: theme.fontFamily, color: theme.textColor, boardId });
+        return;
+      }
       const clipboardItems = e.clipboardData?.items;
       if (clipboardItems) {
         for (let i = 0; i < clipboardItems.length; i++) {
           if (clipboardItems[i].type.indexOf('image') !== -1) {
             const blob = clipboardItems[i].getAsFile();
             if (blob) {
+              if (!hasInteracted) setHasInteracted(true);
               const img = new Image();
               const objectUrl = URL.createObjectURL(blob);
               img.src = objectUrl;
@@ -233,7 +322,7 @@ const App: React.FC = () => {
     };
     window.addEventListener('paste', handlePaste);
     return () => window.removeEventListener('paste', handlePaste);
-  }, [saveItemDb, theme, boardId]);
+  }, [saveItemDb, theme, boardId, hasInteracted, setHasInteracted]);
 
   const handleTextBlur = () => {
     if (!editingText) return;
@@ -273,6 +362,7 @@ const App: React.FC = () => {
   const itemDragEnd = (e: any, item: any) => {
     const newX = e.target.x(), newY = e.target.y();
     pushUndo(items);
+    if (!hasInteracted) setHasInteracted(true);
     setCachedItems(items.map(i => i._id === item._id ? { ...i, x: newX, y: newY } : i));
     saveItemDb({ id: item._id as Id<'items'>, type: item.type, content: item.content, boardId, x: newX, y: newY });
   };
@@ -283,6 +373,7 @@ const App: React.FC = () => {
     const newWidth = Math.max(5, node.width() * sX), newHeight = Math.max(5, node.height() * sY);
     const newX = node.x(), newY = node.y();
     pushUndo(items);
+    if (!hasInteracted) setHasInteracted(true);
     setCachedItems(items.map(i => i._id === item._id ? { ...i, x: newX, y: newY, width: newWidth, height: newHeight } : i));
     saveItemDb({ id: item._id as Id<'items'>, type: item.type, content: item.content, boardId, x: newX, y: newY, width: newWidth, height: newHeight });
   };
@@ -320,7 +411,8 @@ const App: React.FC = () => {
 
           <button style={iconBtn(showGrid)} onClick={() => setShowGrid(!showGrid)} title="Grid · G"><LayoutGrid size={15} /></button>
           <button style={iconBtn()} onClick={handleExportPDF} title="Export PDF"><FileDown size={15} /></button>
-          <button style={iconBtn(showSettings)} onClick={() => setShowSettings(!showSettings)} title="Settings"><SlidersHorizontal size={15} /></button>
+          <button style={iconBtn(showCheckpoints)} onClick={() => { setShowCheckpoints(!showCheckpoints); setShowSettings(false); }} title="Checkpoints"><GitCommitHorizontal size={15} /></button>
+          <button style={iconBtn(showSettings)} onClick={() => { setShowSettings(!showSettings); setShowCheckpoints(false); }} title="Settings"><SlidersHorizontal size={15} /></button>
 
           <div style={{ width: '1px', height: '18px', backgroundColor: `${theme.textColor}20`, margin: '0 4px' }} />
 
@@ -331,37 +423,64 @@ const App: React.FC = () => {
       {/* ── Settings Panel ── */}
       <ThemePanel visible={showSettings} onExportPDF={handleExportPDF} showGrid={showGrid} onToggleGrid={() => setShowGrid(!showGrid)} />
 
+      {/* ── Checkpoints Panel ── */}
+      <CheckpointPanel
+        visible={showCheckpoints}
+        onClose={() => setShowCheckpoints(false)}
+        boardId={boardId}
+        theme={theme}
+        onRestored={() => {
+          setSelectedId(null);
+          setEditingText(null);
+          setShowCheckpoints(false);
+        }}
+      />
+
       {/* ── Inline Text Editor ── */}
       {editingText && (
-        <>
-          <textarea
-            ref={textEditorRef}
-            autoFocus
-            wrap="off"
-            aria-hidden="true"
-            tabIndex={-1}
-            style={{ position: 'absolute', top: editingText.y * scale + position.y, left: editingText.x * scale + position.x, width: `${(editingMetrics?.width || DEFAULT_TEXT_WIDTH) * scale}px`, height: `${(editingMetrics?.height || DEFAULT_TEXT_HEIGHT) * scale}px`, opacity: 0, pointerEvents: 'none', border: 'none', padding: 0, margin: 0, resize: 'none', background: 'transparent', color: 'transparent', caretColor: 'transparent', outline: 'none', overflow: 'hidden', fontFamily: theme.fontFamily, fontSize: `${20 * scale}px`, lineHeight: 1.2, whiteSpace: 'pre', wordBreak: 'normal', overflowWrap: 'normal' }}
-            value={editingText.content}
-            onChange={(e) => {
-              const value = e.target.value;
-              setEditingText({ ...editingText, content: value });
-              resizeTextEditor(e.currentTarget, value);
-            }}
-            onInput={(e) => resizeTextEditor(e.currentTarget, e.currentTarget.value)}
-            onBlur={handleTextBlur}
-            onKeyDown={(e) => { if (e.key === 'Escape') e.currentTarget.blur(); }}
-          />
-
-          <div
-            style={{ position: 'absolute', top: editingText.y * scale + position.y, left: editingText.x * scale + position.x, width: `${(editingMetrics?.width || DEFAULT_TEXT_WIDTH) * scale}px`, height: `${(editingMetrics?.height || DEFAULT_TEXT_HEIGHT) * scale}px`, zIndex: 50, pointerEvents: 'none', border: `1px solid ${theme.textColor}33`, borderRadius: '6px', padding: 0, margin: 0, color: theme.textColor, fontFamily: theme.fontFamily, fontSize: `${20 * scale}px`, lineHeight: 1.2, whiteSpace: 'pre', wordBreak: 'normal', overflowWrap: 'normal', background: 'transparent', boxSizing: 'content-box' }}
-          >
-            {editingText.content || '\u200b'}
-          </div>
-        </>
+        <textarea
+          ref={textEditorRef}
+          autoFocus
+          wrap="off"
+          style={{
+            position: 'absolute',
+            top: editingText.y * scale + position.y,
+            left: editingText.x * scale + position.x,
+            width: `${(editingMetrics?.width || DEFAULT_TEXT_WIDTH) * scale}px`,
+            height: `${(editingMetrics?.height || DEFAULT_TEXT_HEIGHT) * scale}px`,
+            zIndex: 50,
+            border: `1px solid ${theme.textColor}33`,
+            borderRadius: '6px',
+            padding: '4px',
+            margin: '-4px',
+            resize: 'none',
+            background: `${theme.backgroundColor}EE`,
+            color: theme.textColor,
+            fontFamily: theme.fontFamily,
+            fontSize: `${20 * scale}px`,
+            lineHeight: 1.2,
+            whiteSpace: 'pre',
+            wordBreak: 'normal',
+            overflowWrap: 'normal',
+            outline: 'none',
+            overflow: 'hidden',
+            boxSizing: 'content-box',
+            caretColor: theme.textColor,
+          }}
+          value={editingText.content}
+          onChange={(e) => {
+            const value = e.target.value;
+            setEditingText({ ...editingText, content: value });
+            resizeTextEditor(e.currentTarget, value);
+          }}
+          onInput={(e) => resizeTextEditor(e.currentTarget, e.currentTarget.value)}
+          onBlur={handleTextBlur}
+          onKeyDown={(e) => { if (e.key === 'Escape') e.currentTarget.blur(); }}
+        />
       )}
 
       {/* ── Empty State ── */}
-      {items.length === 0 && !editingText && (
+      {items.length === 0 && !editingText && !hasInteracted && (
         <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center', pointerEvents: 'none', userSelect: 'none', color: theme.textColor, fontFamily: theme.fontFamily }}>
           <div style={{ fontSize: '52px', opacity: 0.07, marginBottom: '16px' }}>✦</div>
           <p style={{ fontSize: '13px', opacity: 0.22, fontWeight: 500, margin: 0, lineHeight: 1.8 }}>
@@ -377,7 +496,12 @@ const App: React.FC = () => {
         draggable={mode === 'select' && !editingText}
         ref={stageRef}
         onClick={handleStageClick}
-        onDragEnd={(e: any) => { if (e.target === stageRef.current) setPosition({ x: e.target.x(), y: e.target.y() }); }}
+        onDragEnd={(e: any) => {
+          if (e.target === stageRef.current) {
+            setPosition({ x: e.target.x(), y: e.target.y() });
+            if (!hasInteracted) setHasInteracted(true);
+          }
+        }}
       >
         <Layer>
           {/* Page grid */}
@@ -420,6 +544,7 @@ const App: React.FC = () => {
                       if (mode === 'select') {
                         setSelectedId(null);
                         setEditingText({ _id: item._id, x: item.x, y: item.y, content: item.content });
+                        if (!hasInteracted) setHasInteracted(true);
                       }
                     }}
                   />
