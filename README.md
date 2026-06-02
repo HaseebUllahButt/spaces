@@ -1,4 +1,4 @@
-# Curate
+# Spaces
 
 A spatial curation tool built for creatives. An infinite canvas where ideas, text, and images are arranged freely — not confined to slides, lists, or grids. Designed to feel like a premium creative environment rather than a utility.
 
