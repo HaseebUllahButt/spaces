@@ -11,6 +11,10 @@ interface Props {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onPointerDown: (e: any) => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onDragStart?: (e: any) => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onDragMove?: (e: any) => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onDragEnd: (e: any) => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onTransformEnd: (e: any) => void;
@@ -18,7 +22,7 @@ interface Props {
   height?: number;
 }
 
-const CanvasImage = forwardRef<any, Props>(({ id, x, y, url, draggable, onPointerDown, onDragEnd, onTransformEnd, width: storedWidth, height: storedHeight }, ref) => {
+const CanvasImage = forwardRef<any, Props>(({ id, x, y, url, draggable, onPointerDown, onDragStart, onDragMove, onDragEnd, onTransformEnd, width: storedWidth, height: storedHeight }, ref) => {
   const [image] = useImage(url);
 
   if (!image) return null;
@@ -37,6 +41,8 @@ const CanvasImage = forwardRef<any, Props>(({ id, x, y, url, draggable, onPointe
       height={height}
       draggable={draggable}
       onPointerDown={onPointerDown}
+      onDragStart={onDragStart}
+      onDragMove={onDragMove}
       onDragEnd={onDragEnd}
       onTransformEnd={onTransformEnd}
     />
