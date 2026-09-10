@@ -6,16 +6,17 @@ import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import { useStore } from "../store";
 import {
-  CATEGORY_LABELS,
+  ACCENT_OPTIONS,
+  BASE_MODES,
   FONT_OPTIONS,
-  PRESET_THEMES,
   type Theme,
-  type ThemeCategory,
+  type ThemeMode,
   applyThemeToDocument,
+  composeTheme,
   deriveMutedColor,
   deriveSurfaceColor,
   normalizeTheme,
-  themeFromPreset,
+  parseThemeId,
 } from "../themes";
 import type { CanvasItem } from "../types";
 
@@ -39,7 +40,11 @@ const ThemePanel: React.FC<ThemePanelProps> = ({
   const { theme, setTheme, cachedItems, setCachedItems } = useStore();
   const updateBoardTheme = useMutation(api.board.updateBoardTheme);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [category, setCategory] = useState<ThemeCategory>("light");
+  // Remember the last chosen accent so switching modes keeps the accent (and vice versa).
+  const parsed = parseThemeId(theme.id);
+  const [accentId, setAccentId] = useState<string>(parsed?.accent ?? "brass");
+  const activeMode: ThemeMode | null =
+    parsed?.mode ?? (theme.id === "custom" || theme.id === "extracted" ? null : theme.isDark ? "dark" : "light");
 
   if (!visible) return null;
 
@@ -103,8 +108,6 @@ const ThemePanel: React.FC<ThemePanelProps> = ({
     };
     e.target.value = "";
   };
-
-  const filtered = PRESET_THEMES.filter((t) => t.category === category);
 
   const sectionLabel: React.CSSProperties = {
     fontSize: 10,
@@ -196,79 +199,101 @@ const ThemePanel: React.FC<ThemePanelProps> = ({
           </div>
         </div>
 
-        {/* Category tabs */}
-        <p style={sectionLabel}>Presets</p>
-        <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-          {(["light", "dark", "editorial"] as ThemeCategory[]).map((cat) => (
-            <button
-              key={cat}
-              onClick={() => setCategory(cat)}
-              style={{
-                flex: 1,
-                padding: "7px 0",
-                borderRadius: 8,
-                border: `1px solid ${category === cat ? "var(--accent)" : "var(--border)"}`,
-                background: category === cat ? `color-mix(in srgb, var(--accent) 12%, transparent)` : "transparent",
-                color: category === cat ? "var(--text)" : "var(--muted)",
-                fontSize: 11,
-                fontWeight: 600,
-                cursor: "pointer",
-                transition: "all 0.15s",
-              }}
-            >
-              {CATEGORY_LABELS[cat]}
-            </button>
-          ))}
-        </div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 20 }}>
-          {filtered.map((preset) => {
-            const active = theme.id === preset.id;
-            const t = themeFromPreset(preset);
+        {/* Mode */}
+        <p style={sectionLabel}>Mode</p>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 20 }}>
+          {BASE_MODES.map((mode) => {
+            const active = activeMode === mode.id;
+            const preview = composeTheme(mode.id, accentId);
             return (
               <button
-                key={preset.id}
-                className={`theme-swatch${active ? " active" : ""}`}
-                onClick={() => applyTheme(t)}
-                title={preset.name}
+                key={mode.id}
+                onClick={() => applyTheme(preview)}
+                title={mode.name}
+                style={{
+                  padding: 0,
+                  overflow: "hidden",
+                  borderRadius: 10,
+                  cursor: "pointer",
+                  background: mode.backgroundColor,
+                  border: "1px solid var(--border)",
+                  outline: active ? "2px solid var(--accent)" : "none",
+                  outlineOffset: 2,
+                  opacity: active ? 1 : 0.82,
+                  transition: "opacity 0.15s ease",
+                }}
               >
-                <div style={{ height: 44, background: t.backgroundColor, position: "relative" }}>
+                <div style={{ height: 34, position: "relative" }}>
                   <div
                     style={{
                       position: "absolute",
-                      bottom: 8,
-                      left: 8,
-                      width: 20,
+                      bottom: 6,
+                      left: 9,
+                      width: 16,
                       height: 3,
                       borderRadius: 2,
-                      background: t.textColor,
+                      background: mode.textColor,
+                      opacity: 0.85,
                     }}
                   />
                   <div
                     style={{
                       position: "absolute",
-                      bottom: 8,
-                      right: 8,
-                      width: 10,
-                      height: 10,
+                      bottom: 5,
+                      right: 9,
+                      width: 8,
+                      height: 8,
                       borderRadius: "50%",
-                      background: t.accentColor,
+                      background: preview.accentColor,
                     }}
                   />
                 </div>
                 <div
                   style={{
-                    padding: "6px 8px",
+                    padding: "0 9px 7px",
                     fontSize: 10,
                     fontWeight: 600,
-                    color: t.textColor,
+                    color: mode.textColor,
                     textAlign: "left",
-                    background: t.surfaceColor,
+                    fontFamily: mode.fontFamily,
+                    opacity: 0.9,
                   }}
                 >
-                  {preset.name}
+                  {mode.name}
                 </div>
               </button>
+            );
+          })}
+        </div>
+
+        {/* Accent */}
+        <p style={sectionLabel}>Accent</p>
+        <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+          {ACCENT_OPTIONS.map((accent) => {
+            const active = accentId === accent.id && activeMode !== null;
+            const swatch = theme.isDark ? accent.dark : accent.light;
+            return (
+              <button
+                key={accent.id}
+                onClick={() => {
+                  setAccentId(accent.id);
+                  applyTheme(composeTheme(activeMode ?? (theme.isDark ? "dark" : "light"), accent.id));
+                }}
+                title={accent.name}
+                aria-label={`${accent.name} accent`}
+                style={{
+                  width: 26,
+                  height: 26,
+                  borderRadius: "50%",
+                  background: swatch,
+                  cursor: "pointer",
+                  border: "2px solid var(--bg)",
+                  outline: active ? "2px solid var(--text)" : "1px solid var(--border-strong)",
+                  outlineOffset: 1,
+                  padding: 0,
+                  transition: "outline-color 0.15s",
+                }}
+              />
             );
           })}
         </div>
@@ -378,6 +403,8 @@ const ThemePanel: React.FC<ThemePanelProps> = ({
         <p style={sectionLabel}>Canvas</p>
         <button
           onClick={onToggleGrid}
+          aria-label="Toggle page grid"
+          aria-pressed={showGrid}
           style={{
             width: "100%",
             display: "flex",

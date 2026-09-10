@@ -8,6 +8,7 @@ import {
   Image as ImageIcon,
   Square,
   ArrowUpRight,
+  Waypoints,
   X,
 } from "lucide-react";
 import type { CanvasItem } from "../types";
@@ -20,6 +21,12 @@ const typeMeta = (item: CanvasItem) => {
       return { Icon: Square, label: "Rectangle" };
     case "arrow":
       return { Icon: ArrowUpRight, label: "Arrow" };
+    case "connector":
+      return { Icon: Waypoints, label: "Connector" };
+    case "frame":
+      return { Icon: Square, label: item.content || "Frame" };
+    case "sticky":
+      return { Icon: Square, label: item.content || "Sticky note" };
     default:
       return { Icon: Type, label: "Text" };
   }
@@ -161,7 +168,11 @@ const LayersPanel: React.FC<LayersPanelProps> = ({
                     ) : (
                       <Icon
                         size={14}
-                        color={item.type === "rect" || item.type === "arrow" ? item.color : undefined}
+                        color={
+                          item.type === "rect" || item.type === "arrow" || item.type === "connector"
+                            ? item.color
+                            : undefined
+                        }
                       />
                     )}
                   </div>

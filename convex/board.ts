@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import type { MutationCtx } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 
 const themeValidator = {
   id: v.string(),
@@ -130,21 +131,40 @@ export const deleteBoard = mutation({
 export const getItems = query({
   args: { boardId: v.string() },
   handler: async (ctx, args) => {
-    return await ctx.db
+    const items = await ctx.db
       .query("items")
       .withIndex("by_boardId", (q) => q.eq("boardId", args.boardId))
       .collect();
+    return await Promise.all(items.map(async (item) => ({
+      ...item,
+      content: item.storageId ? (await ctx.storage.getUrl(item.storageId) ?? item.content) : item.content,
+    })));
   },
 });
+
+export const generateImageUploadUrl = mutation({
+  args: {},
+  handler: async (ctx) => await ctx.storage.generateUploadUrl(),
+});
+
+const portValidator = v.union(
+  v.literal("n"),
+  v.literal("e"),
+  v.literal("s"),
+  v.literal("w"),
+);
 
 export const saveItem = mutation({
   args: {
     id: v.optional(v.id("items")),
     type: v.union(
-      v.literal('text'),
-      v.literal('image'),
-      v.literal('rect'),
-      v.literal('arrow'),
+      v.literal("text"),
+      v.literal("image"),
+      v.literal("rect"),
+      v.literal("arrow"),
+      v.literal("connector"),
+      v.literal("frame"),
+      v.literal("sticky"),
     ),
     x: v.number(),
     y: v.number(),
@@ -156,6 +176,14 @@ export const saveItem = mutation({
     fontSize: v.optional(v.number()),
     zIndex: v.optional(v.number()),
     boardId: v.string(),
+    fromId: v.optional(v.string()),
+    toId: v.optional(v.string()),
+    fromPort: v.optional(portValidator),
+    toPort: v.optional(portValidator),
+    waypoints: v.optional(v.array(v.number())),
+    directed: v.optional(v.boolean()),
+    groupId: v.optional(v.string()),
+    storageId: v.optional(v.id("_storage")),
   },
   handler: async (ctx, args) => {
     const { id, ...data } = args;
@@ -175,6 +203,13 @@ export const deleteItem = mutation({
   },
 });
 
+export const clearItemGroup = mutation({
+  args: { id: v.id("items") },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.id, { groupId: undefined });
+  },
+});
+
 export const createCheckpoint = mutation({
   args: { boardId: v.string(), name: v.string() },
   handler: async (ctx, args) => {
@@ -183,18 +218,49 @@ export const createCheckpoint = mutation({
       .withIndex("by_boardId", (q) => q.eq("boardId", args.boardId))
       .collect();
 
-    const checkpointItems = items.map(({ type, x, y, width, height, content, color, fontFamily, fontSize, zIndex }) => ({
-      type,
-      x,
-      y,
-      width,
-      height,
-      content,
-      color,
-      fontFamily,
-      fontSize,
-      zIndex,
-    }));
+    const checkpointItems = items.map(
+      ({
+        type,
+        x,
+        y,
+        width,
+        height,
+        content,
+        color,
+        fontFamily,
+        fontSize,
+        zIndex,
+        fromId,
+        toId,
+        fromPort,
+        toPort,
+        waypoints,
+        directed,
+        groupId,
+        _id,
+        storageId,
+      }) => ({
+        type,
+        x,
+        y,
+        width,
+        height,
+        content,
+        color,
+        fontFamily,
+        fontSize,
+        zIndex,
+        fromId,
+        toId,
+        fromPort,
+        toPort,
+        waypoints,
+        directed,
+        groupId,
+        sourceId: _id,
+        storageId,
+      }),
+    );
 
     return await ctx.db.insert("checkpoints", {
       boardId: args.boardId,
@@ -230,10 +296,44 @@ export const restoreCheckpoint = mutation({
       await ctx.db.delete(item._id);
     }
 
-    for (const item of checkpoint.items) {
-      await ctx.db.insert("items", {
-        ...item,
+    const idMap = new Map<string, string>();
+    const nodes = checkpoint.items.filter((item) => item.type !== "connector");
+    const connectors = checkpoint.items.filter((item) => item.type === "connector");
+
+    // Recreate nodes first, then remap group and connector topology to their new ids.
+    for (const item of nodes) {
+      const sourceId = item.sourceId;
+      const data = { ...item };
+      delete data.sourceId;
+      delete data.groupId;
+      const newId = await ctx.db.insert("items", {
+        ...data,
         boardId: checkpoint.boardId,
+      });
+      if (sourceId) idMap.set(sourceId, newId);
+    }
+    for (const item of nodes) {
+      if (!item.sourceId || !item.groupId) continue;
+      const newId = idMap.get(item.sourceId);
+      const newGroupId = idMap.get(item.groupId);
+      if (newId && newGroupId) await ctx.db.patch(newId as Id<"items">, { groupId: newGroupId });
+    }
+    for (const item of connectors) {
+      const fromId = item.fromId;
+      const toId = item.toId;
+      const data = { ...item };
+      delete data.sourceId;
+      delete data.fromId;
+      delete data.toId;
+      delete data.groupId;
+      const mappedFrom = fromId ? idMap.get(fromId) : undefined;
+      const mappedTo = toId ? idMap.get(toId) : undefined;
+      if (!mappedFrom || !mappedTo) continue;
+      await ctx.db.insert("items", {
+        ...data,
+        boardId: checkpoint.boardId,
+        fromId: mappedFrom,
+        toId: mappedTo,
       });
     }
   },

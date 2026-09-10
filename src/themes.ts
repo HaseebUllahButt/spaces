@@ -1,4 +1,5 @@
 export type ThemeCategory = "light" | "dark" | "editorial";
+export type ThemeMode = ThemeCategory;
 
 export interface Theme {
   id: string;
@@ -22,177 +23,103 @@ export const FONT_OPTIONS = [
   { id: "jetbrains", label: "JetBrains Mono", value: "JetBrains Mono, ui-monospace, monospace" },
 ] as const;
 
-export const PRESET_THEMES: Theme[] = [
-  // ── Light: warm / cool / botanical ──────────────────────────────
+/** The three base modes. Accent is chosen separately and composed in. */
+export interface BaseMode {
+  id: ThemeMode;
+  name: string;
+  backgroundColor: string;
+  textColor: string;
+  mutedColor: string;
+  surfaceColor: string;
+  fontFamily: string;
+  isDark: boolean;
+}
+
+export const BASE_MODES: BaseMode[] = [
   {
-    id: "gallery",
-    name: "Gallery",
-    backgroundColor: "#F6F4EF",
-    textColor: "#211E1A",
-    accentColor: "#A98546",
-    mutedColor: "#8B8478",
+    id: "light",
+    name: "Light",
+    backgroundColor: "#F7F6F2",
+    textColor: "#1D1B17",
+    mutedColor: "#8A857C",
     surfaceColor: "#FFFFFF",
     fontFamily: "Inter, system-ui, sans-serif",
-    category: "light",
+    isDark: false,
   },
   {
-    id: "porcelain",
-    name: "Porcelain",
-    backgroundColor: "#FAFBFC",
-    textColor: "#14171C",
-    accentColor: "#3E6D9C",
-    mutedColor: "#6B7079",
-    surfaceColor: "#FFFFFF",
-    fontFamily: "Inter, system-ui, sans-serif",
-    category: "light",
-  },
-  {
-    id: "sage",
-    name: "Sage",
-    backgroundColor: "#EDF1EA",
-    textColor: "#232B22",
-    accentColor: "#4E7A50",
-    mutedColor: "#77826F",
-    surfaceColor: "#F6F9F3",
-    fontFamily: "DM Sans, system-ui, sans-serif",
-    category: "light",
-  },
-  {
-    id: "slate",
-    name: "Slate",
-    backgroundColor: "#ECEEF1",
-    textColor: "#1B2027",
-    accentColor: "#5A6B7B",
-    mutedColor: "#79828D",
-    surfaceColor: "#F6F7F9",
-    fontFamily: "Inter, system-ui, sans-serif",
-    category: "light",
-  },
-  {
-    id: "blush",
-    name: "Blush",
-    backgroundColor: "#F7EFEC",
-    textColor: "#2C1F1E",
-    accentColor: "#BD6E72",
-    mutedColor: "#9A8480",
-    surfaceColor: "#FDF7F5",
-    fontFamily: "DM Sans, system-ui, sans-serif",
-    category: "light",
-  },
-  // ── Dark: monochrome / blue night / teal deep ───────────────────
-  {
-    id: "studio",
-    name: "Studio",
-    backgroundColor: "#0F0F0F",
-    textColor: "#F3F2EF",
-    accentColor: "#EDEDE8",
-    mutedColor: "#7C7C7A",
-    surfaceColor: "#1A1A1A",
+    id: "dark",
+    name: "Dark",
+    backgroundColor: "#111113",
+    textColor: "#EDEBE6",
+    mutedColor: "#8A8984",
+    surfaceColor: "#1B1B1E",
     fontFamily: "Inter, system-ui, sans-serif",
     isDark: true,
-    category: "dark",
   },
   {
-    id: "obsidian",
-    name: "Obsidian",
-    backgroundColor: "#0B0E18",
-    textColor: "#DCE2EF",
-    accentColor: "#7E97F0",
-    mutedColor: "#656C80",
-    surfaceColor: "#141827",
-    fontFamily: "Inter, system-ui, sans-serif",
-    isDark: true,
-    category: "dark",
-  },
-  {
-    id: "cove",
-    name: "Cove",
-    backgroundColor: "#0A1513",
-    textColor: "#D9E6E1",
-    accentColor: "#46B79C",
-    mutedColor: "#5E756E",
-    surfaceColor: "#10201D",
-    fontFamily: "Inter, system-ui, sans-serif",
-    isDark: true,
-    category: "dark",
-  },
-  {
-    id: "ember",
-    name: "Ember",
-    backgroundColor: "#16171A",
-    textColor: "#E8E6E1",
-    accentColor: "#E0A24C",
-    mutedColor: "#83837E",
-    surfaceColor: "#1F2024",
-    fontFamily: "Inter, system-ui, sans-serif",
-    isDark: true,
-    category: "dark",
-  },
-  {
-    id: "wine",
-    name: "Wine",
-    backgroundColor: "#150E11",
-    textColor: "#EEDDE0",
-    accentColor: "#C06B84",
-    mutedColor: "#85707A",
-    surfaceColor: "#1E151A",
-    fontFamily: "Inter, system-ui, sans-serif",
-    isDark: true,
-    category: "dark",
-  },
-  // ── Editorial: warm serif / mono spec / dark serif ──────────────
-  {
-    id: "archival",
-    name: "Archival",
-    backgroundColor: "#FBF8F1",
-    textColor: "#1E1A15",
-    accentColor: "#8A2E2A",
-    mutedColor: "#7C7367",
-    surfaceColor: "#FFFDF8",
+    id: "editorial",
+    name: "Editorial",
+    backgroundColor: "#FBF7EE",
+    textColor: "#221D15",
+    mutedColor: "#867C6C",
+    surfaceColor: "#FFFDF7",
     fontFamily: "Fraunces, Georgia, serif",
-    category: "editorial",
-  },
-  {
-    id: "blueprint",
-    name: "Blueprint",
-    backgroundColor: "#E6ECF3",
-    textColor: "#123457",
-    accentColor: "#1E5FBE",
-    mutedColor: "#5E718A",
-    surfaceColor: "#F1F5FA",
-    fontFamily: "Space Mono, ui-monospace, monospace",
-    category: "editorial",
-  },
-  {
-    id: "nocturne",
-    name: "Nocturne",
-    backgroundColor: "#15120D",
-    textColor: "#EAE3D4",
-    accentColor: "#C09A4E",
-    mutedColor: "#8A8072",
-    surfaceColor: "#1E1A13",
-    fontFamily: "Playfair Display, Georgia, serif",
-    isDark: true,
-    category: "editorial",
-  },
-  {
-    id: "meridian",
-    name: "Meridian",
-    backgroundColor: "#F4F1E8",
-    textColor: "#1B2422",
-    accentColor: "#1F6F6A",
-    mutedColor: "#7C8079",
-    surfaceColor: "#FBF9F2",
-    fontFamily: "Fraunces, Georgia, serif",
-    category: "editorial",
+    isDark: false,
   },
 ];
 
-export const DEFAULT_THEME = PRESET_THEMES[0];
-
-export function getThemeById(id: string): Theme | undefined {
-  return PRESET_THEMES.find((t) => t.id === id);
+/** Accents carry a light-mode and a dark-mode value so they read on both grounds. */
+export interface AccentOption {
+  id: string;
+  name: string;
+  light: string;
+  dark: string;
 }
+
+export const ACCENT_OPTIONS: AccentOption[] = [
+  { id: "brass", name: "Brass", light: "#A07A3B", dark: "#C9A45E" },
+  { id: "indigo", name: "Indigo", light: "#4A5FC4", dark: "#8497F2" },
+  { id: "teal", name: "Teal", light: "#2C7C74", dark: "#57B2A5" },
+  { id: "forest", name: "Forest", light: "#43734A", dark: "#74A87C" },
+  { id: "rose", name: "Rose", light: "#B25F6B", dark: "#D3868F" },
+  { id: "violet", name: "Violet", light: "#7752B8", dark: "#A588E0" },
+];
+
+export function getBaseMode(modeId: string): BaseMode {
+  return BASE_MODES.find((m) => m.id === modeId) ?? BASE_MODES[0];
+}
+
+export function getAccent(accentId: string): AccentOption {
+  return ACCENT_OPTIONS.find((a) => a.id === accentId) ?? ACCENT_OPTIONS[0];
+}
+
+export function composeTheme(modeId: string, accentId: string): Theme {
+  const mode = getBaseMode(modeId);
+  const accent = getAccent(accentId);
+  return {
+    id: `${mode.id}:${accent.id}`,
+    name: `${mode.name} · ${accent.name}`,
+    backgroundColor: mode.backgroundColor,
+    textColor: mode.textColor,
+    accentColor: mode.isDark ? accent.dark : accent.light,
+    mutedColor: mode.mutedColor,
+    surfaceColor: mode.surfaceColor,
+    fontFamily: mode.fontFamily,
+    isDark: mode.isDark,
+    category: mode.id,
+  };
+}
+
+/** Recover mode/accent from a composed theme id ("dark:teal"). Null for custom themes. */
+export function parseThemeId(id: string): { mode: ThemeMode; accent: string } | null {
+  const [modeId, accentId] = id.split(":");
+  if (!modeId || !accentId) return null;
+  if (!BASE_MODES.some((m) => m.id === modeId)) return null;
+  if (!ACCENT_OPTIONS.some((a) => a.id === accentId)) return null;
+  return { mode: modeId as ThemeMode, accent: accentId };
+}
+
+export const DEFAULT_THEME = composeTheme("light", "brass");
 
 export function deriveMutedColor(textColor: string, backgroundColor: string): string {
   const parse = (hex: string) => {
@@ -261,13 +188,3 @@ export function applyThemeToDocument(theme: Theme) {
   root.style.setProperty("--shadow", `${theme.textColor}20`);
   root.dataset.themeMode = theme.isDark ? "dark" : "light";
 }
-
-export function themeFromPreset(preset: Theme): Theme {
-  return normalizeTheme(preset);
-}
-
-export const CATEGORY_LABELS: Record<ThemeCategory, string> = {
-  light: "Light",
-  dark: "Dark",
-  editorial: "Editorial",
-};

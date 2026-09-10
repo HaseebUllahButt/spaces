@@ -10,6 +10,8 @@ import {
   SlidersHorizontal,
   GitCommitHorizontal,
   Layers,
+  Paintbrush,
+  Presentation,
 } from "lucide-react";
 import { useStore } from "./store";
 import CanvasImage from "./components/CanvasImage";
@@ -22,7 +24,14 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
 import { applyThemeToDocument } from "./themes";
-import type { CanvasItem } from "./types";
+import { defaultViewport, type CanvasItem, type PortSide } from "./types";
+import {
+  connectorPoints,
+  buildConnectorRoutes,
+  nearestPort,
+  pathMidpoint,
+  pointsBounds,
+} from "./connectorUtils";
 
 const EMPTY_ARRAY: CanvasItem[] = [];
 const DEFAULT_TEXT_WIDTH = 360;
@@ -62,6 +71,7 @@ const App: React.FC = () => {
   const mode = useStore((s) => s.mode);
   const setMode = useStore((s) => s.setMode);
   const activeBoardId = useStore((s) => s.activeBoardId);
+  const boardViewports = useStore((s) => s.boardViewports);
   const getViewport = useStore((s) => s.getViewport);
   const setViewportTransform = useStore((s) => s.setViewportTransform);
   const setShowGrid = useStore((s) => s.setShowGrid);
@@ -76,9 +86,15 @@ const App: React.FC = () => {
   const { boards, ready: boardReady } = useBoardBootstrap();
 
   const boardId = activeBoardId ?? "";
-  const viewport = boardId ? getViewport(boardId) : null;
+  const viewport = boardId ? boardViewports[boardId] ?? defaultViewport() : null;
   const showGrid = viewport?.showGrid ?? false;
   const hasInteracted = viewport?.hasInteracted ?? false;
+
+  const toggleGrid = React.useCallback(() => {
+    if (!boardId) return;
+    const current = getViewport(boardId);
+    setShowGrid(boardId, !current.showGrid);
+  }, [boardId, getViewport, setShowGrid]);
 
   // Live camera lives in React state (and is applied directly to the Stage during wheel).
   // Store is only updated on a rAF throttle so pan/zoom never blocks the main thread with persist.
@@ -86,7 +102,8 @@ const App: React.FC = () => {
   const [position, setPositionLocal] = React.useState(viewport?.position ?? { x: 0, y: 0 });
   const scaleRef = useRef(scale);
   const positionRef = useRef(position);
-  const viewSyncRaf = useRef(0);
+  const viewSyncTimer = useRef(0);
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   React.useEffect(() => {
     if (!boardId) return;
@@ -106,13 +123,15 @@ const App: React.FC = () => {
   }, [boardId, setViewportTransform]);
 
   const scheduleViewSync = React.useCallback(() => {
-    if (viewSyncRaf.current) return;
-    viewSyncRaf.current = requestAnimationFrame(() => {
-      viewSyncRaf.current = 0;
+    // Per-frame work stays off React: the stage transform is already applied
+    // imperatively, and the dot-grid parallax is a direct style write. The
+    // full App render (and store persist) runs once when the gesture pauses.
+    window.clearTimeout(viewSyncTimer.current);
+    viewSyncTimer.current = window.setTimeout(() => {
       setScaleLocal(scaleRef.current);
       setPositionLocal(positionRef.current);
       flushViewToStore();
-    });
+    }, 120);
   }, [flushViewToStore]);
 
   const [selectedIds, setSelectedIds] = React.useState<string[]>([]);
@@ -120,6 +139,9 @@ const App: React.FC = () => {
   const [showCheckpoints, setShowCheckpoints] = React.useState(false);
   const [showLayers, setShowLayers] = React.useState(false);
   const [menuCollapsed, setMenuCollapsed] = React.useState(false);
+  const [formatStyle, setFormatStyle] = React.useState<Pick<CanvasItem, "color" | "fontFamily" | "fontSize"> | null>(null);
+  const [formatPainterActive, setFormatPainterActive] = React.useState(false);
+  const [presentationIndex, setPresentationIndex] = React.useState<number | null>(null);
   const [editingText, setEditingText] = React.useState<{
     _id?: string;
     x: number;
@@ -140,6 +162,9 @@ const App: React.FC = () => {
   const pendingDeletes = useRef<Set<string>>(new Set());
   const groupDrag = useRef<{ anchorId: string; start: Map<string, { x: number; y: number }> } | null>(null);
   const drawStart = useRef<{ x: number; y: number; type: "rect" | "arrow" } | null>(null);
+  /** Live node positions while dragging (so linked connectors follow before dragEnd). */
+  const livePos = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const connectorRouteRaf = useRef(0);
   const suppressClick = useRef(false);
   // Ignore blur right after opening the editor (mouseup/click after draw steals focus from the textarea).
   const ignoreBlurUntil = useRef(0);
@@ -151,6 +176,7 @@ const App: React.FC = () => {
   const actionRefs = useRef({
     deleteItems: (_ids: string[]) => {},
     reconcileHistory: async (_target: CanvasItem[]) => {},
+    adjustFontSize: (_delta: number) => {},
   });
 
   useEffect(() => {
@@ -204,6 +230,8 @@ const App: React.FC = () => {
   const dbItems = useQuery(api.board.getItems, boardId ? { boardId } : "skip");
   const saveItemDb = useMutation(api.board.saveItem);
   const deleteItemDb = useMutation(api.board.deleteItem);
+  const clearItemGroupDb = useMutation(api.board.clearItemGroup);
+  const generateImageUploadUrl = useMutation(api.board.generateImageUploadUrl);
 
   useEffect(() => {
     localUpdates.current.clear();
@@ -258,7 +286,12 @@ const App: React.FC = () => {
     () =>
       items
         .map((item, i) => ({ item, i }))
-        .sort((a, b) => (a.item.zIndex ?? 0) - (b.item.zIndex ?? 0) || a.i - b.i)
+        .sort((a, b) => {
+          // Structural edges stay behind nodes even when their layer values are newer.
+          const rank = (item: CanvasItem) => item.type === "frame" ? 0 : item.type === "connector" ? 1 : 2;
+          const edgeOrder = rank(a.item) - rank(b.item);
+          return edgeOrder || (a.item.zIndex ?? 0) - (b.item.zIndex ?? 0) || a.i - b.i;
+        })
         .map(({ item }) => item),
     [items],
   );
@@ -267,17 +300,67 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!trRef.current || !stageRef.current) return;
-    // Arrows use endpoint handles instead of the box transformer (which looks awful on thin lines).
+    // Arrows/connectors use custom handles, not the box transformer.
     const nodes = selectedIds
       .map((id) => {
         const item = items.find((i) => i._id === id);
-        if (!item || item.type === "arrow") return null;
+        if (!item || item.type === "arrow" || item.type === "connector" || item.type === "frame") return null;
         return stageRef.current.findOne("#" + id);
       })
       .filter(Boolean);
     trRef.current.nodes(nodes);
     trRef.current.getLayer()?.batchDraw();
   }, [selectedIds, items]);
+
+  const itemsById = React.useMemo(() => {
+    const m = new Map<string, CanvasItem>();
+    for (const it of items) m.set(it._id, it);
+    return m;
+  }, [items]);
+  const connectorRoutes = React.useMemo(() => buildConnectorRoutes(items), [items]);
+
+  /** Resolve an item with any in-flight drag position applied. */
+  const itemWithLivePos = React.useCallback(
+    (id: string | undefined): CanvasItem | undefined => {
+      if (!id) return undefined;
+      const base = itemsById.get(id);
+      if (!base) return undefined;
+      const live = livePos.current.get(id);
+      return live ? { ...base, x: live.x, y: live.y } : base;
+    },
+    [itemsById],
+  );
+
+  const refreshConnectorNodes = React.useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const liveItems = items.map((item) => itemWithLivePos(item._id) ?? item);
+    const liveRoutes = buildConnectorRoutes(liveItems);
+    for (const c of items) {
+      if (c.type !== "connector" || !c.fromId || !c.toId || !c.fromPort || !c.toPort) continue;
+      const pts = liveRoutes.get(c._id);
+      const node = stage.findOne("#" + c._id);
+      if (node && pts) {
+        node.points(pts);
+        node.position({ x: 0, y: 0 });
+      }
+    }
+    stage.batchDraw();
+  }, [items, itemWithLivePos]);
+
+  const scheduleConnectorRefresh = React.useCallback(() => {
+    if (connectorRouteRaf.current) return;
+    connectorRouteRaf.current = requestAnimationFrame(() => {
+      connectorRouteRaf.current = 0;
+      refreshConnectorNodes();
+    });
+  }, [refreshConnectorNodes]);
+
+  const cancelConnectorRefresh = () => {
+    if (!connectorRouteRaf.current) return;
+    cancelAnimationFrame(connectorRouteRaf.current);
+    connectorRouteRaf.current = 0;
+  };
 
   const handleWheel = (e: any) => {
     if (!boardId) return;
@@ -403,6 +486,26 @@ const App: React.FC = () => {
     }
   };
 
+  /** Topmost rectangle under a world point (small forgiving margin). */
+  const rectAtPoint = (point: { x: number; y: number }): CanvasItem | undefined => {
+    const margin = 12 / scale;
+    let best: CanvasItem | undefined;
+    let bestZ = -Infinity;
+    for (const item of items) {
+      if (item.type !== "rect") continue;
+      const w = item.width ?? DEFAULT_RECT_WIDTH;
+      const h = item.height ?? DEFAULT_RECT_HEIGHT;
+      const inside =
+        point.x >= item.x - margin && point.x <= item.x + w + margin &&
+        point.y >= item.y - margin && point.y <= item.y + h + margin;
+      if (inside && (item.zIndex ?? 0) >= bestZ) {
+        bestZ = item.zIndex ?? 0;
+        best = item;
+      }
+    }
+    return best;
+  };
+
   const handleStageMouseUp = () => {
     const start = drawStart.current;
     if (!start) return;
@@ -430,9 +533,17 @@ const App: React.FC = () => {
         width: Math.abs(dx),
         height: Math.abs(dy),
       });
-    } else {
-      commitShape("arrow", { x: start.x, y: start.y, width: dx, height: dy });
+      return;
     }
+    // Arrow drawn box-to-box becomes a linked connector (Excalidraw-style);
+    // anywhere else it stays a free arrow.
+    const from = rectAtPoint(start);
+    const to = rectAtPoint(p);
+    if (from && to && from._id !== to._id) {
+      commitConnector(from._id, nearestPort(from, start), to._id, nearestPort(to, p));
+      return;
+    }
+    commitShape("arrow", { x: start.x, y: start.y, width: dx, height: dy });
   };
 
   const resetView = () => {
@@ -450,7 +561,34 @@ const App: React.FC = () => {
     setViewportTransform(boardId, { scale: 1, position: { x: 0, y: 0 } });
   };
 
-  // Persist a full item (used for layer reordering + group moves).
+  const navigateToWorld = React.useCallback((worldX: number, worldY: number, nextScale?: number) => {
+    if (!boardId) return;
+    nextScale = nextScale ?? scaleRef.current;
+    const nextPosition = {
+      x: window.innerWidth / 2 - worldX * nextScale,
+      y: (window.innerHeight - 48) / 2 - worldY * nextScale,
+    };
+    scaleRef.current = nextScale;
+    positionRef.current = nextPosition;
+    setScaleLocal(nextScale);
+    setPositionLocal(nextPosition);
+    stageRef.current?.scale({ x: nextScale, y: nextScale });
+    stageRef.current?.position(nextPosition);
+    stageRef.current?.batchDraw();
+    setViewportTransform(boardId, { scale: nextScale, position: nextPosition });
+  }, [boardId, setViewportTransform]);
+
+  const jumpToItem = (item: CanvasItem, fit = false) => {
+    const width = item.width ?? 120;
+    const height = item.height ?? 80;
+    const fitScale = fit
+      ? Math.min(2, Math.max(0.15, Math.min((window.innerWidth - 160) / width, (window.innerHeight - 160) / height)))
+      : scaleRef.current;
+    navigateToWorld(item.x + width / 2, item.y + height / 2, fitScale);
+    setSelectedIds([item._id]);
+  };
+
+  // Persist a full item (used for layer reordering + group moves + connectors).
   const persistItem = (item: CanvasItem) => {
     if (!boardId || String(item._id).startsWith("temp-")) return;
     saveItemDb({
@@ -466,6 +604,14 @@ const App: React.FC = () => {
       fontFamily: item.fontFamily,
       fontSize: item.fontSize,
       zIndex: item.zIndex,
+      fromId: item.fromId,
+      toId: item.toId,
+      fromPort: item.fromPort,
+      toPort: item.toPort,
+      waypoints: item.type === "connector" ? [] : item.waypoints,
+      directed: item.directed,
+      groupId: item.groupId,
+      storageId: item.storageId as Id<"_storage"> | undefined,
     });
   };
 
@@ -497,15 +643,100 @@ const App: React.FC = () => {
   const deleteItems = (ids: string[]) => {
     if (!boardId || ids.length === 0) return;
     const del = new Set(ids);
+    const deletedFrameIds = new Set(
+      items.filter((item) => del.has(item._id) && item.type === "frame").map((item) => item._id),
+    );
+    // Also remove connectors attached to deleted nodes.
+    for (const it of items) {
+      if (
+        it.type === "connector" &&
+        ((it.fromId && del.has(it.fromId)) || (it.toId && del.has(it.toId)))
+      ) {
+        del.add(it._id);
+      }
+    }
     pushUndo(boardId, items);
-    for (const id of ids) {
+    for (const id of del) {
       if (!String(id).startsWith("temp-")) pendingDeletes.current.add(id);
     }
-    setCachedItems(items.filter((i) => !del.has(i._id)));
-    ids.forEach((id) => {
+    setCachedItems(
+      items
+        .filter((i) => !del.has(i._id))
+        .map((item) =>
+          item.groupId && deletedFrameIds.has(item.groupId) ? { ...item, groupId: undefined } : item,
+        ),
+    );
+    for (const child of items) {
+      if (!child.groupId || !deletedFrameIds.has(child.groupId) || del.has(child._id)) continue;
+      localUpdates.current.set(child._id, {
+        ...(localUpdates.current.get(child._id) ?? {}),
+        groupId: undefined,
+      });
+      if (!String(child._id).startsWith("temp-")) {
+        clearItemGroupDb({ id: child._id as Id<"items"> });
+      }
+    }
+    del.forEach((id) => {
       if (!String(id).startsWith("temp-")) deleteItemDb({ id: id as Id<"items"> });
     });
     setSelectedIds((prev) => prev.filter((id) => !del.has(id)));
+  };
+
+  const commitConnector = (
+    fromId: string,
+    fromPort: PortSide,
+    toId: string,
+    toPort: PortSide,
+  ) => {
+    if (!boardId || fromId === toId) return;
+    const from = itemsById.get(fromId);
+    const to = itemsById.get(toId);
+    if (!from || !to || from.type !== "rect" || to.type !== "rect") return;
+
+    const pts = connectorPoints(from, to, fromPort, toPort, undefined, items) ?? [0, 0, 1, 1];
+    const bounds = pointsBounds(pts);
+    const zIndex = nextZIndex();
+    const color = theme.accentColor;
+    const tempId = `temp-${Date.now()}`;
+    const newItem: CanvasItem = {
+      _id: tempId,
+      _creationTime: Date.now(),
+      type: "connector",
+      ...bounds,
+      content: "",
+      color,
+      zIndex,
+      fromId,
+      toId,
+      fromPort,
+      toPort,
+      waypoints: [],
+      directed: true,
+    };
+
+    pushUndo(boardId, items);
+    if (!hasInteracted) setHasInteracted(boardId, true);
+    setCachedItems([...items, newItem]);
+    setMode("select");
+    setSelectedIds([tempId]);
+
+    saveItemDb({
+      type: "connector",
+      ...bounds,
+      content: "",
+      color,
+      zIndex,
+      boardId,
+      fromId,
+      toId,
+      fromPort,
+      toPort,
+      waypoints: [],
+      directed: true,
+    }).then((newId) => {
+      updateHistoryIds(boardId, tempId, newId);
+      setSelectedIds((prev) => prev.map((id) => (id === tempId ? newId : id)));
+    });
   };
 
   // Persist a freshly drawn rectangle or arrow, then select it (do not auto-enter text edit).
@@ -556,11 +787,122 @@ const App: React.FC = () => {
     });
   };
 
+  const createFrameFromSelection = async () => {
+    if (!boardId) return;
+    const children = items.filter(
+      (item) =>
+        selectedIds.includes(item._id) &&
+        item.type !== "connector" &&
+        item.type !== "frame" &&
+        !item.groupId,
+    );
+    if (children.length < 2) return;
+    const minX = Math.min(...children.map((item) => item.x));
+    const minY = Math.min(...children.map((item) => item.y));
+    const maxX = Math.max(...children.map((item) => item.x + (item.width ?? DEFAULT_RECT_WIDTH)));
+    const maxY = Math.max(...children.map((item) => item.y + (item.height ?? DEFAULT_RECT_HEIGHT)));
+    const frame: Omit<CanvasItem, "_id" | "_creationTime"> = {
+      type: "frame",
+      x: minX - 28,
+      y: minY - 52,
+      width: maxX - minX + 56,
+      height: maxY - minY + 80,
+      content: "",
+      color: theme.accentColor,
+      fontFamily: theme.fontFamily,
+      fontSize: 14,
+      zIndex: Math.min(...children.map((item) => item.zIndex ?? 0)) - 1,
+    };
+    pushUndo(boardId, items);
+    const frameId = await saveItemDb({
+      ...frame,
+      storageId: frame.storageId as Id<"_storage"> | undefined,
+      boardId,
+    });
+    const next = items.map((item) =>
+      children.some((child) => child._id === item._id) ? { ...item, groupId: frameId } : item,
+    );
+    const savedFrame: CanvasItem = {
+      ...frame,
+      _id: frameId,
+      _creationTime: Date.now(),
+    };
+    setCachedItems([...next, savedFrame]);
+    for (const child of children) {
+      localUpdates.current.set(child._id, {
+        ...(localUpdates.current.get(child._id) ?? {}),
+        groupId: frameId,
+      });
+      persistItem({ ...child, groupId: frameId });
+    }
+    setSelectedIds([frameId, ...children.map((item) => item._id)]);
+    if (!hasInteracted) setHasInteracted(boardId, true);
+  };
+
+  const ungroupSelection = () => {
+    if (!boardId) return;
+    const frameIds = new Set<string>();
+    for (const id of selectedIds) {
+      const item = itemsById.get(id);
+      if (item?.type === "frame") frameIds.add(item._id);
+      else if (item?.groupId) frameIds.add(item.groupId);
+    }
+    if (frameIds.size === 0) return;
+    pushUndo(boardId, items);
+    const children = items.filter((item) => item.groupId && frameIds.has(item.groupId));
+    setCachedItems(items.filter((item) => !frameIds.has(item._id)).map((item) =>
+      item.groupId && frameIds.has(item.groupId) ? { ...item, groupId: undefined } : item,
+    ));
+    for (const child of children) {
+      localUpdates.current.set(child._id, {
+        ...(localUpdates.current.get(child._id) ?? {}),
+        groupId: undefined,
+      });
+      if (!String(child._id).startsWith("temp-")) {
+        clearItemGroupDb({ id: child._id as Id<"items"> });
+      }
+    }
+    for (const frameId of frameIds) {
+      pendingDeletes.current.add(frameId);
+      deleteItemDb({ id: frameId as Id<"items"> });
+    }
+    setSelectedIds(children.map((item) => item._id));
+  };
+
   const setShapeColor = (item: CanvasItem, color: string) => {
     if (!boardId) return;
     pushUndo(boardId, items);
     setCachedItems(items.map((i) => (i._id === item._id ? { ...i, color } : i)));
     persistItem({ ...item, color });
+  };
+
+  const adjustSelectedFontSize = (delta: number) => {
+    if (!boardId) return;
+    if (selectedIdsRef.current.length !== 1) return;
+    const targets = items.filter(
+      (item) => selectedIdsRef.current.includes(item._id) &&
+        item.type === "text",
+    );
+    if (targets.length === 0) return;
+    pushUndo(boardId, items);
+    const patchedById = new Map<string, CanvasItem>();
+    for (const item of targets) {
+      const fontSize = Math.max(6, Math.min(160, (item.fontSize ?? BASE_FONT_SIZE) + delta));
+      const patch: Partial<CanvasItem> = { fontSize };
+      if (item.type === "text") {
+        const metrics = measureTextBox(item.content, item.fontFamily || theme.fontFamily, fontSize);
+        patch.width = metrics.width;
+        patch.height = metrics.height;
+      }
+      const patched = { ...item, ...patch };
+      patchedById.set(item._id, patched);
+      localUpdates.current.set(item._id, {
+        ...(localUpdates.current.get(item._id) ?? {}),
+        ...patch,
+      });
+      persistItem(patched);
+    }
+    setCachedItems(items.map((item) => patchedById.get(item._id) ?? item));
   };
 
   const reconcileHistory = async (target: CanvasItem[]) => {
@@ -577,10 +919,18 @@ const App: React.FC = () => {
       }
     }
 
-    const idMap = new Map<string, string>();
-    for (const item of targetReal) {
-      if (!currentIds.has(item._id)) {
-        const newId = await saveItemDb({
+    const idMap = new Map<string, string>(currentReal.map((item) => [item._id, item._id]));
+    const missing = targetReal
+      .filter((item) => !currentIds.has(item._id))
+      .sort((a, b) => {
+        const rank = (item: CanvasItem) => item.type === "frame" ? 0 : item.type === "connector" ? 2 : 1;
+        return rank(a) - rank(b);
+      });
+    for (const item of missing) {
+      const mappedFrom = item.fromId ? idMap.get(item.fromId) : undefined;
+      const mappedTo = item.toId ? idMap.get(item.toId) : undefined;
+      if (item.type === "connector" && (!mappedFrom || !mappedTo)) continue;
+      const newId = await saveItemDb({
           type: item.type,
           x: item.x,
           y: item.y,
@@ -591,10 +941,17 @@ const App: React.FC = () => {
           fontFamily: item.fontFamily,
           fontSize: item.fontSize,
           zIndex: item.zIndex,
+          fromId: mappedFrom,
+          toId: mappedTo,
+          fromPort: item.fromPort,
+          toPort: item.toPort,
+          waypoints: item.waypoints,
+          directed: item.directed,
+          groupId: item.groupId ? idMap.get(item.groupId) : undefined,
+          storageId: item.storageId as Id<"_storage"> | undefined,
           boardId,
-        });
-        idMap.set(item._id, newId);
-      }
+      });
+      idMap.set(item._id, newId);
     }
 
     for (const item of targetReal) {
@@ -606,7 +963,16 @@ const App: React.FC = () => {
             cur.y !== item.y ||
             cur.content !== item.content ||
             cur.width !== item.width ||
-            cur.height !== item.height)
+            cur.height !== item.height ||
+            cur.color !== item.color ||
+            cur.zIndex !== item.zIndex ||
+            cur.fromId !== item.fromId ||
+            cur.toId !== item.toId ||
+            cur.fromPort !== item.fromPort ||
+            cur.toPort !== item.toPort ||
+            cur.directed !== item.directed ||
+            cur.groupId !== item.groupId ||
+            JSON.stringify(cur.waypoints) !== JSON.stringify(item.waypoints))
         ) {
           saveItemDb({
             id: item._id as Id<"items">,
@@ -620,15 +986,31 @@ const App: React.FC = () => {
             width: item.width,
             height: item.height,
             zIndex: item.zIndex,
+            fromId: item.fromId ? (idMap.get(item.fromId) ?? item.fromId) : undefined,
+            toId: item.toId ? (idMap.get(item.toId) ?? item.toId) : undefined,
+            fromPort: item.fromPort,
+            toPort: item.toPort,
+            waypoints: item.waypoints,
+            directed: item.directed,
+            groupId: item.groupId ? (idMap.get(item.groupId) ?? item.groupId) : undefined,
+            storageId: item.storageId as Id<"_storage"> | undefined,
             boardId,
           });
         }
       }
     }
 
-    const mapped = target.map((item) => {
+    const mapped = target.flatMap((item) => {
       const mappedId = idMap.get(item._id);
-      return mappedId ? { ...item, _id: mappedId } : item;
+      return mappedId
+        ? [{
+            ...item,
+            _id: mappedId,
+            fromId: item.fromId ? idMap.get(item.fromId) : undefined,
+            toId: item.toId ? idMap.get(item.toId) : undefined,
+            groupId: item.groupId ? idMap.get(item.groupId) : undefined,
+          }]
+        : [];
     });
     setCachedItems(mapped.filter((i) => !String(i._id).startsWith("temp-")));
     idMap.forEach((newId, oldId) => updateHistoryIds(boardId, oldId, newId));
@@ -641,6 +1023,15 @@ const App: React.FC = () => {
       if (!boardId) return;
       const itemsNow = itemsRef.current;
       const selectedNow = selectedIdsRef.current;
+
+      if (
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === ">" || e.key === "<")) ||
+        (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "]" || e.key === "["))
+      ) {
+        e.preventDefault();
+        actionRefs.current.adjustFontSize(e.key === ">" || e.key === "]" ? 2 : -2);
+        return;
+      }
 
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === "z") {
         e.preventDefault();
@@ -682,9 +1073,9 @@ const App: React.FC = () => {
           setShowCheckpoints(false);
         }
         if (e.key.toLowerCase() === "m") setMenuCollapsed((v) => !v);
-        if (e.key.toLowerCase() === "g") {
-          const vp = getViewport(boardId);
-          setShowGrid(boardId, !vp.showGrid);
+        if (e.code === "KeyG" || e.key.toLowerCase() === "g") {
+          e.preventDefault();
+          toggleGrid();
         }
       }
 
@@ -692,6 +1083,8 @@ const App: React.FC = () => {
         setShowSettings(false);
         setShowCheckpoints(false);
         setShowLayers(false);
+        setFormatPainterActive(false);
+        setPresentationIndex(null);
         setSelectedIds([]);
         setMode("select");
       }
@@ -703,14 +1096,15 @@ const App: React.FC = () => {
     return () => window.removeEventListener("keydown", handleKeyDown);
     // Stable listener: reads latest values via refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [boardId]);
+  }, [boardId, toggleGrid]);
 
   const handleExportPDF = () => {
     if (items.length === 0) return alert("Board is empty!");
-    // A4 at 96dpi logical size; capture at high pixelRatio so the PDF is full-res.
+    // A4 at 96dpi logical size; 2× capture keeps it crisp while JPEG keeps the file small.
     const PAGE_W = 794;
     const PAGE_H = 1123;
-    const PDF_PIXEL_RATIO = Math.max(window.devicePixelRatio || 1, 3);
+    const PDF_PIXEL_RATIO = 2;
+    const PDF_JPEG_QUALITY = 0.82;
 
     const pdf = new jsPDF({ orientation: "p", unit: "px", format: [PAGE_W, PAGE_H], compress: true });
     const populatedPages = new Set<string>();
@@ -737,18 +1131,24 @@ const App: React.FC = () => {
       stage.position({ x: -page.x * PAGE_W, y: -page.y * PAGE_H });
       stage.scale({ x: 1, y: 1 });
       stage.batchDraw();
-      pdf.setFillColor(theme.backgroundColor);
-      pdf.rect(0, 0, PAGE_W, PAGE_H, "F");
-      // Full-res raster: 3×+ pixel density, lossless PNG, no FAST compression.
-      const dataUrl = stage.toDataURL({
+      // Composite the (transparent) stage onto the theme background, then encode as
+      // JPEG — an order of magnitude smaller than lossless PNG at no visible cost.
+      const stageCanvas = stage.toCanvas({
         x: 0,
         y: 0,
         width: PAGE_W,
         height: PAGE_H,
         pixelRatio: PDF_PIXEL_RATIO,
-        mimeType: "image/png",
       });
-      pdf.addImage(dataUrl, "PNG", 0, 0, PAGE_W, PAGE_H, undefined, "NONE");
+      const pageCanvas = document.createElement("canvas");
+      pageCanvas.width = stageCanvas.width;
+      pageCanvas.height = stageCanvas.height;
+      const ctx = pageCanvas.getContext("2d")!;
+      ctx.fillStyle = theme.backgroundColor;
+      ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+      ctx.drawImage(stageCanvas, 0, 0);
+      const dataUrl = pageCanvas.toDataURL("image/jpeg", PDF_JPEG_QUALITY);
+      pdf.addImage(dataUrl, "JPEG", 0, 0, PAGE_W, PAGE_H, undefined, "FAST");
     }
 
     stage.position(originalPos);
@@ -793,20 +1193,9 @@ const App: React.FC = () => {
               const img = new Image();
               const objectUrl = URL.createObjectURL(blob);
               img.src = objectUrl;
-              img.onload = () => {
-                const canvas = document.createElement("canvas");
+              img.onload = async () => {
                 let w = img.width,
                   h = img.height;
-                const maxDim = 1200;
-                if (w > maxDim || h > maxDim) {
-                  const r = Math.min(maxDim / w, maxDim / h);
-                  w *= r;
-                  h *= r;
-                }
-                canvas.width = w;
-                canvas.height = h;
-                const ctx = canvas.getContext("2d");
-                if (ctx) ctx.drawImage(img, 0, 0, w, h);
                 let bw = w,
                   bh = h;
                 if (bw > 600 || bh > 600) {
@@ -819,17 +1208,48 @@ const App: React.FC = () => {
                   bw /= curScale;
                   bh /= curScale;
                 }
-                saveItemDb({
-                  type: "image",
-                  x,
-                  y,
-                  width: bw,
-                  height: bh,
-                  content: canvas.toDataURL("image/jpeg", 0.8),
-                  zIndex: topZ(),
-                  boardId,
-                });
-                URL.revokeObjectURL(objectUrl);
+                try {
+                  const uploadUrl = await generateImageUploadUrl({});
+                  const response = await fetch(uploadUrl, {
+                    method: "POST",
+                    headers: { "Content-Type": blob.type || "application/octet-stream" },
+                    body: blob,
+                  });
+                  if (!response.ok) throw new Error(`Image upload failed (${response.status})`);
+                  const { storageId } = await response.json() as { storageId: string };
+                  await saveItemDb({
+                    type: "image",
+                    x,
+                    y,
+                    width: bw,
+                    height: bh,
+                    content: "",
+                    storageId: storageId as Id<"_storage">,
+                    zIndex: topZ(),
+                    boardId,
+                  });
+                } catch (error) {
+                  // Keep paste usable offline: only the fallback is resized/compressed into the item.
+                  console.warn("Full-resolution upload unavailable; using local image fallback", error);
+                  const canvas = document.createElement("canvas");
+                  const maxDim = 1200;
+                  const ratio = Math.min(1, maxDim / w, maxDim / h);
+                  canvas.width = Math.round(w * ratio);
+                  canvas.height = Math.round(h * ratio);
+                  canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
+                  await saveItemDb({
+                    type: "image",
+                    x,
+                    y,
+                    width: bw,
+                    height: bh,
+                    content: canvas.toDataURL("image/jpeg", 0.82),
+                    zIndex: topZ(),
+                    boardId,
+                  });
+                } finally {
+                  URL.revokeObjectURL(objectUrl);
+                }
               };
             }
           }
@@ -838,7 +1258,7 @@ const App: React.FC = () => {
     };
     window.addEventListener("paste", handlePaste);
     return () => window.removeEventListener("paste", handlePaste);
-  }, [saveItemDb, theme, boardId, hasInteracted, setHasInteracted]);
+  }, [saveItemDb, generateImageUploadUrl, theme, boardId, hasInteracted, setHasInteracted]);
 
   const handleTextBlur = () => {
     if (!editingText || !boardId) return;
@@ -909,6 +1329,16 @@ const App: React.FC = () => {
           color: theme.textColor,
           zIndex,
           boardId,
+        }).then((newId) => {
+          const local = localUpdates.current.get(tempId);
+          if (local) {
+            localUpdates.current.delete(tempId);
+            localUpdates.current.set(newId, local);
+          }
+          updateHistoryIds(boardId, tempId, newId);
+          setSelectedIds((previous) =>
+            previous.map((id) => id === tempId ? newId : id),
+          );
         });
       }
     } else if (isReal) {
@@ -923,19 +1353,56 @@ const App: React.FC = () => {
     setMode("select");
   };
 
-  const itemPointerDown = (id: string) => {
+  const itemPointerDown = (id: string, e?: any) => {
+    if (formatPainterActive && formatStyle && boardId) {
+      if (e) e.cancelBubble = true;
+      const target = itemsById.get(id);
+      if (!target || target.type === "connector" || target.type === "frame") return;
+      const patch = {
+        color: formatStyle.color,
+        fontFamily: formatStyle.fontFamily,
+        fontSize: formatStyle.fontSize,
+      };
+      pushUndo(boardId, items);
+      localUpdates.current.set(id, { ...(localUpdates.current.get(id) ?? {}), ...patch });
+      setCachedItems(items.map((item) => item._id === id ? { ...item, ...patch } : item));
+      persistItem({ ...target, ...patch });
+      setSelectedIds([id]);
+      setFormatPainterActive(false);
+      return;
+    }
     // In text/draw modes, clicks on items shouldn't select them (they belong to the active tool).
     if (mode !== "select") return;
-    // Keep an existing multi-selection if the clicked item is part of it (so it can be group-dragged).
-    setSelectedIds((prev) => (prev.includes(id) ? prev : [id]));
+    const item = itemsById.get(id);
+    // Clicking the frame selects/moves the full group; clicking a child edits that child directly.
+    const frameId = item?.type === "frame" ? item._id : undefined;
+    const targetIds = frameId
+      ? items.filter((candidate) => candidate._id === frameId || candidate.groupId === frameId).map((candidate) => candidate._id)
+      : [id];
+    const additive = Boolean(e?.evt?.shiftKey || e?.evt?.ctrlKey || e?.evt?.metaKey);
+    setSelectedIds((prev) => {
+      if (!additive) return targetIds.every((targetId) => prev.includes(targetId)) ? prev : targetIds;
+      const allSelected = targetIds.every((targetId) => prev.includes(targetId));
+      return allSelected
+        ? prev.filter((selectedId) => !targetIds.includes(selectedId))
+        : [...new Set([...prev, ...targetIds])];
+    });
   };
 
   const nodeDragStart = (item: CanvasItem) => {
-    if (selectedIds.length > 1 && selectedIds.includes(item._id)) {
+    livePos.current.set(item._id, { x: item.x, y: item.y });
+    const frameId = item.type === "frame" ? item._id : undefined;
+    const dragIds = frameId
+      ? items.filter((candidate) => candidate._id === frameId || candidate.groupId === frameId).map((candidate) => candidate._id)
+      : selectedIds;
+    if (dragIds.length > 1 && dragIds.includes(item._id)) {
       const start = new Map<string, { x: number; y: number }>();
-      for (const id of selectedIds) {
+      for (const id of dragIds) {
         const it = items.find((i) => i._id === id);
-        if (it) start.set(id, { x: it.x, y: it.y });
+        if (it) {
+          start.set(id, { x: it.x, y: it.y });
+          livePos.current.set(id, { x: it.x, y: it.y });
+        }
       }
       groupDrag.current = { anchorId: item._id, start };
     } else {
@@ -961,6 +1428,7 @@ const App: React.FC = () => {
       const dx = e.target.x() - anchorStart.x;
       const dy = e.target.y() - anchorStart.y;
       g.start.forEach((s, id) => {
+        livePos.current.set(id, { x: s.x + dx, y: s.y + dy });
         if (id === item._id) return;
         const other = stage?.findOne("#" + id);
         if (other) other.position({ x: s.x + dx, y: s.y + dy });
@@ -969,21 +1437,26 @@ const App: React.FC = () => {
           syncArrowHandles(id, s.x + dx, s.y + dy, it.width ?? 0, it.height ?? 0);
         }
       });
+      livePos.current.set(item._id, { x: e.target.x(), y: e.target.y() });
       if (item.type === "arrow") {
         syncArrowHandles(item._id, e.target.x(), e.target.y(), item.width ?? 0, item.height ?? 0);
       }
+      scheduleConnectorRefresh();
       trRef.current?.forceUpdate();
       stage?.batchDraw();
       return;
     }
+    livePos.current.set(item._id, { x: e.target.x(), y: e.target.y() });
     // Solo arrow drag: keep endpoint dots glued to the shaft
     if (item.type === "arrow") {
       syncArrowHandles(item._id, e.target.x(), e.target.y(), item.width ?? 0, item.height ?? 0);
-      stage?.batchDraw();
     }
+    if (item.type === "rect") scheduleConnectorRefresh();
+    stage?.batchDraw();
   };
 
   const nodeDragEnd = (e: any, item: CanvasItem) => {
+    cancelConnectorRefresh();
     const g = groupDrag.current;
     if (g && g.anchorId === item._id && boardId) {
       const anchorStart = g.start.get(item._id)!;
@@ -997,13 +1470,26 @@ const App: React.FC = () => {
         const prev = localUpdates.current.get(id) ?? {};
         localUpdates.current.set(id, { ...prev, ...pos });
       });
-      setCachedItems(
-        items.map((i) => (moved.has(i._id) ? { ...i, ...moved.get(i._id)! } : i)),
-      );
+      const nextItems = items.map((i) => (moved.has(i._id) ? { ...i, ...moved.get(i._id)! } : i));
+      // Refresh connector bounds after node move (topology unchanged; auto-route updates).
+      const byId = new Map(nextItems.map((i) => [i._id, i]));
+      const withConnectors = nextItems.map((i) => {
+        if (i.type !== "connector" || !i.fromId || !i.toId || !i.fromPort || !i.toPort) return i;
+        const pts = connectorPoints(byId.get(i.fromId), byId.get(i.toId), i.fromPort, i.toPort, undefined, nextItems);
+        if (!pts) return i;
+        return { ...i, waypoints: [], ...pointsBounds(pts) };
+      });
+      setCachedItems(withConnectors);
       moved.forEach((pos, id) => {
-        const it = items.find((i) => i._id === id);
+        const it = withConnectors.find((i) => i._id === id);
         if (it) persistItem({ ...it, x: pos.x, y: pos.y });
       });
+      withConnectors.forEach((it) => {
+        if (it.type === "connector" && (moved.has(it.fromId!) || moved.has(it.toId!))) {
+          persistItem(it);
+        }
+      });
+      livePos.current.clear();
       groupDrag.current = null;
       return;
     }
@@ -1019,7 +1505,18 @@ const App: React.FC = () => {
     if (!hasInteracted) setHasInteracted(boardId, true);
     const prev = localUpdates.current.get(item._id) ?? {};
     localUpdates.current.set(item._id, { ...prev, x: newX, y: newY });
-    setCachedItems(items.map((i) => (i._id === item._id ? { ...i, x: newX, y: newY } : i)));
+    const movedItem = { ...item, x: newX, y: newY };
+    const nextItems = items.map((i) => (i._id === item._id ? movedItem : i));
+    const byId = new Map(nextItems.map((i) => [i._id, i]));
+    const withConnectors = nextItems.map((i) => {
+      if (i.type !== "connector" || !i.fromId || !i.toId || !i.fromPort || !i.toPort) return i;
+      if (i.fromId !== item._id && i.toId !== item._id) return i;
+      const pts = connectorPoints(byId.get(i.fromId), byId.get(i.toId), i.fromPort, i.toPort, undefined, nextItems);
+      if (!pts) return i;
+      return { ...i, ...pointsBounds(pts) };
+    });
+    setCachedItems(withConnectors);
+    livePos.current.clear();
     saveItemDb({
       id: item._id as Id<"items">,
       type: item.type,
@@ -1028,6 +1525,34 @@ const App: React.FC = () => {
       x: newX,
       y: newY,
     });
+    withConnectors.forEach((it) => {
+      if (it.type === "connector" && (it.fromId === item._id || it.toId === item._id)) {
+        persistItem(it);
+      }
+    });
+  };
+
+  const patchConnector = (connector: CanvasItem, patch: Partial<CanvasItem>) => {
+    if (!boardId) return;
+    const patched = { ...connector, waypoints: [], ...patch };
+    if (patched.fromId && patched.toId && patched.fromPort && patched.toPort) {
+      const pts = connectorPoints(
+        itemsById.get(patched.fromId),
+        itemsById.get(patched.toId),
+        patched.fromPort,
+        patched.toPort,
+        undefined,
+        items,
+      );
+      if (pts) Object.assign(patched, pointsBounds(pts));
+    }
+    pushUndo(boardId, items);
+    localUpdates.current.set(connector._id, {
+      ...(localUpdates.current.get(connector._id) ?? {}),
+      ...patch,
+    });
+    setCachedItems(items.map((item) => item._id === connector._id ? patched : item));
+    persistItem(patched);
   };
 
   const itemTransformEnd = (e: any, item: CanvasItem) => {
@@ -1091,7 +1616,18 @@ const App: React.FC = () => {
     const newHeight = Math.max(5, baseH * sY);
     const patch = { x: newX, y: newY, width: newWidth, height: newHeight };
     localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...patch });
-    setCachedItems(items.map((i) => (i._id === item._id ? { ...i, ...patch } : i)));
+    const resized = { ...item, ...patch };
+    const nextItems = items.map((i) => (i._id === item._id ? resized : i));
+    const byId = new Map(nextItems.map((i) => [i._id, i]));
+    const withConnectors = nextItems.map((i) => {
+      if (i.type !== "connector" || !i.fromId || !i.toId || !i.fromPort || !i.toPort) return i;
+      if (i.fromId !== item._id && i.toId !== item._id) return i;
+      // Clear custom bends on resize so the route re-fits cleanly.
+      const pts = connectorPoints(byId.get(i.fromId), byId.get(i.toId), i.fromPort, i.toPort, [], nextItems);
+      if (!pts) return i;
+      return { ...i, waypoints: [], ...pointsBounds(pts) };
+    });
+    setCachedItems(withConnectors);
     saveItemDb({
       id: item._id as Id<"items">,
       type: item.type,
@@ -1102,24 +1638,70 @@ const App: React.FC = () => {
       boardId,
       ...patch,
     });
+    withConnectors.forEach((it) => {
+      if (it.type === "connector" && (it.fromId === item._id || it.toId === item._id)) {
+        persistItem(it);
+      }
+    });
   };
 
   // Keep keyboard/action handlers pointing at the latest implementations.
   actionRefs.current.deleteItems = deleteItems;
   actionRefs.current.reconcileHistory = reconcileHistory;
+  actionRefs.current.adjustFontSize = adjustSelectedFontSize;
 
   const zoomPct = Math.round(scale * 100);
   const selectedIsText =
     selectedIds.length === 1 && items.some((i) => i._id === selectedIds[0] && i.type === "text");
   const selectedArrows = items.filter((i) => i.type === "arrow" && selectedIds.includes(i._id));
-  const selectedOnlyArrows =
-    selectedIds.length > 0 && selectedArrows.length === selectedIds.length;
+  const selectedConnectors = items.filter(
+    (i) => i.type === "connector" && selectedIds.includes(i._id),
+  );
+  const selectedConnector = selectedConnectors.length === 1 ? selectedConnectors[0] : undefined;
+  const selectedOnlyLines =
+    selectedIds.length > 0 &&
+    selectedIds.every((id) => {
+      const t = itemsById.get(id)?.type;
+      return t === "arrow" || t === "connector";
+    });
   const selectedShape =
     selectedIds.length === 1
       ? items.find(
-          (i) => i._id === selectedIds[0] && (i.type === "rect" || i.type === "arrow"),
+          (i) =>
+            i._id === selectedIds[0] &&
+            (i.type === "rect" || i.type === "arrow" || i.type === "connector" || i.type === "frame"),
         )
       : undefined;
+  const selectedFrame = items.find(
+    (item) => selectedIds.includes(item._id) && item.type === "frame",
+  );
+  const canCreateFrame = selectedIds.filter((id) => {
+    const item = itemsById.get(id);
+    return item && item.type !== "connector" && item.type !== "frame" && !item.groupId;
+  }).length >= 2;
+  const canUngroup = selectedIds.some((id) => {
+    const item = itemsById.get(id);
+    return item?.type === "frame" || Boolean(item?.groupId);
+  });
+  const canAdjustFontSize = selectedIds.some((id) => {
+    return selectedIds.length === 1 && itemsById.get(id)?.type === "text";
+  });
+  const singleSelectedItem = selectedIds.length === 1 ? itemsById.get(selectedIds[0]) : undefined;
+  const canCopyStyle = Boolean(
+    singleSelectedItem && singleSelectedItem.type !== "connector" && singleSelectedItem.type !== "frame",
+  );
+  const presentationFrames = items
+    .filter((item) => item.type === "frame")
+    .sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0) || a._creationTime - b._creationTime);
+
+  const showPresentationFrame = (index: number) => {
+    const normalized = Math.max(0, Math.min(index, presentationFrames.length - 1));
+    const frame = presentationFrames[normalized];
+    if (!frame) return;
+    setPresentationIndex(normalized);
+    jumpToItem(frame, true);
+    setSelectedIds([]);
+  };
 
   // Drag an arrow endpoint; `which: "start"` keeps the tip fixed, `"end"` keeps the tail fixed.
   const arrowEndpointDrag = (
@@ -1164,20 +1746,24 @@ const App: React.FC = () => {
   const editingMetrics = editingText
     ? measureTextBox(editingText.content, theme.fontFamily, editingFontSize)
     : null;
-  const dotGrid = theme.isDark ? `${theme.textColor}10` : `${theme.textColor}0D`;
+  const pageGridStartX = Math.floor((-position.x / scale) / 794) - 1;
+  const pageGridEndX = Math.ceil((window.innerWidth - position.x) / scale / 794) + 1;
+  const pageGridStartY = Math.floor((-position.y / scale) / 1123) - 1;
+  const pageGridEndY = Math.ceil((window.innerHeight - 48 - position.y) / scale / 1123) + 1;
 
   return (
     <div
+      ref={containerRef}
       style={{
         width: "100vw",
         height: "100vh",
         backgroundColor: theme.backgroundColor,
         overflow: "hidden",
-        backgroundImage: boardReady ? `radial-gradient(${dotGrid} 1px, transparent 0)` : undefined,
-        backgroundSize: "24px 24px",
-        backgroundPosition: `${position.x % 24}px ${position.y % 24}px`,
         transition: "background-color 0.4s ease",
-        cursor: mode === "text" || mode === "rect" || mode === "arrow" ? "crosshair" : "default",
+        cursor:
+          formatPainterActive || mode === "text" || mode === "rect" || mode === "arrow"
+            ? "crosshair"
+            : "default",
       }}
     >
       <BoardSwitcher
@@ -1242,11 +1828,10 @@ const App: React.FC = () => {
           <button
             className={`tool-btn icon-only${mode === "arrow" ? " active" : ""}`}
             onClick={() => setMode("arrow")}
-            title="Arrow · A — drag to draw"
+            title="Arrow · A — drag box to box to link them"
           >
             <ArrowUpRight size={15} />
           </button>
-
           {selectedShape && (
             <label
               className="tool-btn icon-only"
@@ -1271,15 +1856,163 @@ const App: React.FC = () => {
             </label>
           )}
 
+          {selectedConnector && (
+            <>
+              <input
+                key={`${selectedConnector._id}-${selectedConnector.content}`}
+                defaultValue={selectedConnector.content}
+                placeholder="Edge label"
+                aria-label="Connector label"
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") event.currentTarget.blur();
+                }}
+                onBlur={(event) => {
+                  if (event.currentTarget.value !== selectedConnector.content) {
+                    patchConnector(selectedConnector, { content: event.currentTarget.value });
+                  }
+                }}
+                style={{
+                  width: 92,
+                  height: 28,
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  padding: "0 8px",
+                  background: "var(--surface)",
+                  color: "var(--text)",
+                  font: "inherit",
+                  fontSize: 11,
+                }}
+              />
+              <button
+                className="tool-btn"
+                onClick={() => patchConnector(selectedConnector, { directed: selectedConnector.directed === false })}
+                title="Toggle one-way / undirected"
+                style={{ minWidth: 32, paddingInline: 8 }}
+              >
+                {selectedConnector.directed === false ? "—" : "→"}
+              </button>
+            </>
+          )}
+
+          {selectedFrame && (
+            <input
+              key={`${selectedFrame._id}-${selectedFrame.content}`}
+              defaultValue={selectedFrame.content === "Frame" ? "" : selectedFrame.content}
+              placeholder="Frame title"
+              aria-label="Frame title"
+              onClick={(event) => event.stopPropagation()}
+              onKeyDown={(event) => {
+                event.stopPropagation();
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+              onBlur={(event) => {
+                if (event.currentTarget.value !== (selectedFrame.content === "Frame" ? "" : selectedFrame.content)) {
+                  const content = event.currentTarget.value;
+                  pushUndo(boardId, items);
+                  localUpdates.current.set(selectedFrame._id, {
+                    ...(localUpdates.current.get(selectedFrame._id) ?? {}),
+                    content,
+                  });
+                  setCachedItems(items.map((item) => item._id === selectedFrame._id ? { ...item, content } : item));
+                  persistItem({ ...selectedFrame, content });
+                }
+              }}
+              style={{
+                width: 92,
+                height: 28,
+                border: "1px solid var(--border)",
+                borderRadius: 8,
+                padding: "0 8px",
+                background: "var(--surface)",
+                color: "var(--text)",
+                font: "inherit",
+                fontSize: 11,
+              }}
+            />
+          )}
+
+          {canAdjustFontSize && (
+            <>
+              <button
+                className="tool-btn"
+                onClick={() => adjustSelectedFontSize(-2)}
+                title="Decrease font size · ["
+                aria-label="Decrease font size"
+                style={{ minWidth: 32, paddingInline: 8 }}
+              >
+                A−
+              </button>
+              <button
+                className="tool-btn"
+                onClick={() => adjustSelectedFontSize(2)}
+                title="Increase font size · ]"
+                aria-label="Increase font size"
+                style={{ minWidth: 32, paddingInline: 8 }}
+              >
+                A+
+              </button>
+            </>
+          )}
+
+          {canCreateFrame && (
+            <button
+              className="tool-btn"
+              onClick={createFrameFromSelection}
+              title="Group selection in a titled frame"
+              style={{ paddingInline: 9, fontSize: 11 }}
+            >
+              frame
+            </button>
+          )}
+          {canUngroup && (
+            <button
+              className="tool-btn"
+              onClick={ungroupSelection}
+              title="Remove frame and keep its contents"
+              style={{ paddingInline: 9, fontSize: 11 }}
+            >
+              ungroup
+            </button>
+          )}
           <div className="toolbar-divider" />
 
           <button
             className={`tool-btn icon-only${showGrid ? " active-subtle" : ""}`}
-            onClick={() => setShowGrid(boardId, !showGrid)}
+            onClick={toggleGrid}
             title="Grid · G"
+            aria-label="Toggle page grid"
+            aria-pressed={showGrid}
           >
             <LayoutGrid size={15} />
           </button>
+
+          {canCopyStyle && (
+            <button
+              className={`tool-btn icon-only${formatPainterActive ? " active" : ""}`}
+              onClick={() => {
+                setFormatStyle({
+                  color: singleSelectedItem?.color,
+                  fontFamily: singleSelectedItem?.fontFamily,
+                  fontSize: singleSelectedItem?.fontSize,
+                });
+                setFormatPainterActive(true);
+              }}
+              title="Copy style, then click another item"
+            >
+              <Paintbrush size={15} />
+            </button>
+          )}
+          {presentationFrames.length > 0 && (
+            <button
+              className="tool-btn icon-only"
+              onClick={() => showPresentationFrame(0)}
+              title="Present frames in layer order"
+            >
+              <Presentation size={15} />
+            </button>
+          )}
           <button
             className={`tool-btn icon-only${showLayers ? " active-subtle" : ""}`}
             onClick={() => {
@@ -1328,7 +2061,7 @@ const App: React.FC = () => {
         boardId={boardId}
         onExportPDF={handleExportPDF}
         showGrid={showGrid}
-        onToggleGrid={() => setShowGrid(boardId, !showGrid)}
+        onToggleGrid={toggleGrid}
       />
 
       <CheckpointPanel
@@ -1356,6 +2089,34 @@ const App: React.FC = () => {
         onDelete={(id) => deleteItems([id])}
       />
 
+      {presentationIndex !== null && presentationFrames[presentationIndex] && (
+        <div
+          style={{
+            position: "absolute",
+            right: 20,
+            top: 66,
+            zIndex: 55,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: 6,
+            border: "1px solid var(--border)",
+            borderRadius: 12,
+            background: "var(--surface)",
+            boxShadow: "0 12px 35px rgba(0,0,0,.14)",
+          }}
+        >
+          <button className="tool-btn" disabled={presentationIndex === 0} onClick={() => showPresentationFrame(presentationIndex - 1)}>←</button>
+          <span style={{ fontSize: 11, color: "var(--muted)", minWidth: 105, textAlign: "center" }}>
+            {presentationFrames[presentationIndex].content && presentationFrames[presentationIndex].content !== "Frame"
+              ? presentationFrames[presentationIndex].content
+              : "Untitled frame"} · {presentationIndex + 1}/{presentationFrames.length}
+          </span>
+          <button className="tool-btn" disabled={presentationIndex === presentationFrames.length - 1} onClick={() => showPresentationFrame(presentationIndex + 1)}>→</button>
+          <button className="tool-btn" onClick={() => setPresentationIndex(null)}>Exit</button>
+        </div>
+      )}
+
       {items.length === 0 && !editingText && !hasInteracted && (
         <div
           style={{
@@ -1372,9 +2133,9 @@ const App: React.FC = () => {
         >
           <div style={{ fontSize: 48, opacity: 0.06, marginBottom: 16 }}>✦</div>
           <p style={{ fontSize: 13, color: theme.mutedColor, margin: 0, lineHeight: 1.8, fontWeight: 500 }}>
-            Ctrl+V to paste · T or double-click to add text
+            Ctrl+V to paste · T or double-click for text
             <br />
-            T or double-click to place text anywhere · R for box · Del to remove
+            R rect · A arrow (box to box links them) · Del to remove
           </p>
         </div>
       )}
@@ -1410,15 +2171,16 @@ const App: React.FC = () => {
       >
         <Layer perfectDrawEnabled={false}>
           {showGrid &&
-            Array.from({ length: 9 }).map((_, i) =>
-              Array.from({ length: 9 }).map((_, j) => (
+            Array.from({ length: Math.max(0, pageGridEndX - pageGridStartX) }).map((_, i) =>
+              Array.from({ length: Math.max(0, pageGridEndY - pageGridStartY) }).map((_, j) => (
                 <Rect
-                  key={`g-${i}-${j}`}
-                  x={(i - 3) * 794}
-                  y={(j - 3) * 1123}
+                  key={`g-${pageGridStartX + i}-${pageGridStartY + j}`}
+                  x={(pageGridStartX + i) * 794}
+                  y={(pageGridStartY + j) * 1123}
                   width={794}
                   height={1123}
-                  stroke={`${theme.textColor}18`}
+                  stroke={theme.textColor}
+                  opacity={0.2}
                   strokeWidth={1 / scale}
                   dash={[6 / scale, 6 / scale]}
                   listening={false}
@@ -1429,6 +2191,52 @@ const App: React.FC = () => {
             )}
 
           {orderedItems.map((item) => {
+            if (item.type === "frame") {
+              const width = item.width ?? 320;
+              const height = item.height ?? 220;
+              const color = item.color || theme.accentColor;
+              const selected = selectedIds.includes(item._id);
+              return (
+                <Group
+                  key={item._id}
+                  id={item._id}
+                  x={item.x}
+                  y={item.y}
+                  draggable={mode === "select"}
+                  onPointerDown={(e: any) => itemPointerDown(item._id, e)}
+                  onDragStart={() => nodeDragStart(item)}
+                  onDragMove={(e: any) => nodeDragMove(e, item)}
+                  onDragEnd={(e: any) => nodeDragEnd(e, item)}
+                >
+                  <Rect
+                    width={width}
+                    height={height}
+                    cornerRadius={14}
+                    fill={theme.surfaceColor}
+                    opacity={0.58}
+                    stroke={color}
+                    strokeWidth={selected ? 2.5 : 1.5}
+                    dash={selected ? [] : [8, 6]}
+                    perfectDrawEnabled={false}
+                    shadowForStrokeEnabled={false}
+                  />
+                  {item.content && item.content !== "Frame" && (
+                    <KonvaText
+                      x={14}
+                      y={12}
+                      width={Math.max(20, width - 28)}
+                      text={item.content}
+                      fontSize={item.fontSize ?? 14}
+                      fontStyle="bold"
+                      fontFamily={item.fontFamily || theme.fontFamily}
+                      fill={theme.textColor}
+                      listening={false}
+                    />
+                  )}
+                </Group>
+              );
+            }
+
             if (item.type === "text") {
               if (editingText?._id === item._id) return null;
 
@@ -1455,7 +2263,7 @@ const App: React.FC = () => {
                   shadowForStrokeEnabled={false}
                   hitStrokeWidth={0}
                   draggable={mode === "select"}
-                  onPointerDown={() => itemPointerDown(item._id)}
+                  onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
                   onDragEnd={(e: any) => nodeDragEnd(e, item)}
@@ -1471,6 +2279,10 @@ const App: React.FC = () => {
               const color = item.color || theme.accentColor;
               const w = item.width ?? DEFAULT_RECT_WIDTH;
               const h = item.height ?? DEFAULT_RECT_HEIGHT;
+              // In arrow mode, ports are passive hints that arrows snap to boxes.
+              const showPorts = mode === "arrow";
+              const portR = 5 / scale;
+              const ports: PortSide[] = ["n", "e", "s", "w"];
               return (
                 <Group
                   key={item._id}
@@ -1478,7 +2290,7 @@ const App: React.FC = () => {
                   x={item.x}
                   y={item.y}
                   draggable={mode === "select"}
-                  onPointerDown={() => itemPointerDown(item._id)}
+                  onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
                   onDragEnd={(e: any) => nodeDragEnd(e, item)}
@@ -1495,7 +2307,87 @@ const App: React.FC = () => {
                     perfectDrawEnabled={false}
                     shadowForStrokeEnabled={false}
                   />
+                  {showPorts &&
+                    ports.map((port) => {
+                      // Ports are in local group coords (0,0 = rect top-left).
+                      const local = {
+                        n: { x: w / 2, y: 0 },
+                        s: { x: w / 2, y: h },
+                        e: { x: w, y: h / 2 },
+                        w: { x: 0, y: h / 2 },
+                      }[port];
+                      return (
+                        <Circle
+                          key={port}
+                          x={local.x}
+                          y={local.y}
+                          radius={portR}
+                          fill={theme.surfaceColor}
+                          stroke={theme.accentColor}
+                          strokeWidth={1.5 / scale}
+                          perfectDrawEnabled={false}
+                          listening={false}
+                        />
+                      );
+                    })}
                 </Group>
+              );
+            }
+
+            if (item.type === "connector") {
+              const from = itemWithLivePos(item.fromId);
+              const to = itemWithLivePos(item.toId);
+              if (!from || !to || !item.fromPort || !item.toPort) return null;
+              const pts = connectorRoutes.get(item._id);
+              if (!pts || pts.length < 4) return null;
+              const color = item.color || theme.accentColor;
+              const isSelected = selectedIds.includes(item._id);
+              const labelPoint = pathMidpoint(pts);
+              const labelWidth = Math.max(36, item.content.length * 7.2 + 16);
+              return (
+                <React.Fragment key={item._id}>
+                  <Arrow
+                    id={item._id}
+                    x={0}
+                    y={0}
+                    points={pts}
+                    stroke={color}
+                    fill={color}
+                    strokeWidth={isSelected ? 2.5 : 2}
+                    pointerAtEnding={item.directed !== false}
+                    pointerLength={8}
+                    pointerWidth={8}
+                    lineCap="round"
+                    lineJoin="round"
+                    hitStrokeWidth={22}
+                    perfectDrawEnabled={false}
+                    shadowForStrokeEnabled={false}
+                    draggable={false}
+                    onPointerDown={(e: any) => itemPointerDown(item._id, e)}
+                  />
+                  {item.content && (
+                    <Group x={labelPoint.x - labelWidth / 2} y={labelPoint.y - 11} listening={false}>
+                      <Rect
+                        width={labelWidth}
+                        height={22}
+                        cornerRadius={6}
+                        fill={theme.surfaceColor}
+                        stroke={`${color}55`}
+                        strokeWidth={1 / scale}
+                      />
+                      <KonvaText
+                        text={item.content}
+                        width={labelWidth}
+                        height={22}
+                        align="center"
+                        verticalAlign="middle"
+                        fontSize={12}
+                        fontFamily={theme.fontFamily}
+                        fill={theme.textColor}
+                      />
+                    </Group>
+                  )}
+                </React.Fragment>
               );
             }
 
@@ -1522,13 +2414,17 @@ const App: React.FC = () => {
                   perfectDrawEnabled={false}
                   shadowForStrokeEnabled={false}
                   draggable={mode === "select"}
-                  onPointerDown={() => itemPointerDown(item._id)}
+                  onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
                   onDragEnd={(e: any) => nodeDragEnd(e, item)}
                 />
               );
             }
+
+            // Sticky notes were removed; skip any legacy items instead of
+            // letting them fall through to the image renderer.
+            if (item.type !== "image") return null;
 
             return (
               <CanvasImage
@@ -1540,7 +2436,7 @@ const App: React.FC = () => {
                 width={item.width}
                 height={item.height}
                 draggable={mode === "select"}
-                onPointerDown={() => itemPointerDown(item._id)}
+                onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                 onDragStart={() => nodeDragStart(item)}
                 onDragMove={(e: any) => nodeDragMove(e, item)}
                 onDragEnd={(e: any) => nodeDragEnd(e, item)}
@@ -1575,8 +2471,7 @@ const App: React.FC = () => {
             lineJoin="round"
             perfectDrawEnabled={false}
           />
-
-          {/* Arrow endpoint handles — two small dots instead of a cluttered resize box */}
+          {/* Free-arrow endpoint handles — two small dots instead of a cluttered resize box */}
           {mode === "select" &&
             selectedArrows.map((arrow) => {
               const color = arrow.color || theme.accentColor;
@@ -1630,7 +2525,7 @@ const App: React.FC = () => {
               );
             })}
 
-          {selectedIds.length > 0 && (
+          {mode === "select" && selectedIds.length > 0 && (
             <Transformer
               ref={trRef}
               borderStroke={theme.accentColor}
@@ -1641,11 +2536,11 @@ const App: React.FC = () => {
               anchorSize={8}
               anchorCornerRadius={2}
               rotateEnabled={false}
-              resizeEnabled={!selectedOnlyArrows}
-              borderEnabled={!selectedOnlyArrows}
+              resizeEnabled={!selectedOnlyLines}
+              borderEnabled={!selectedOnlyLines}
               keepRatio={selectedIsText}
               enabledAnchors={
-                selectedOnlyArrows
+                selectedOnlyLines
                   ? []
                   : selectedIsText
                     ? ["top-left", "top-right", "bottom-left", "bottom-right"]

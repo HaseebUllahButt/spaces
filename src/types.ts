@@ -1,6 +1,9 @@
 import type { Theme } from "./themes";
 
-export type ItemType = "text" | "image" | "rect" | "arrow";
+export type ItemType = "text" | "image" | "rect" | "arrow" | "connector" | "frame" | "sticky";
+
+/** Attachment side on a rectangle for linked connectors. */
+export type PortSide = "n" | "e" | "s" | "w";
 
 export interface CanvasItem {
   _id: string;
@@ -15,6 +18,25 @@ export interface CanvasItem {
   fontFamily?: string;
   fontSize?: number;
   zIndex?: number;
+  /** Connector: source node id */
+  fromId?: string;
+  /** Connector: target node id */
+  toId?: string;
+  /** Connector: port on source */
+  fromPort?: PortSide;
+  /** Connector: port on target */
+  toPort?: PortSide;
+  /**
+   * Connector: optional intermediate bend points as flat [x,y,x,y,...] in world space.
+   * Empty / missing → auto orthogonal route between ports.
+   */
+  waypoints?: number[];
+  /** Connector: show an arrowhead when true (default). */
+  directed?: boolean;
+  /** Frame id for items that move as a persistent group. */
+  groupId?: string;
+  /** Convex storage id for full-resolution images. */
+  storageId?: string;
 }
 
 export type { Theme };

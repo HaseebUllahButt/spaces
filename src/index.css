@@ -220,6 +220,10 @@ select {
 .tool-btn.icon-only:hover {
   color: var(--text);
 }
+.tool-btn.icon-only.active,
+.tool-btn.icon-only.active:hover {
+  color: var(--bg);
+}
 .tool-btn.icon-only.active-subtle {
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   color: var(--text);
