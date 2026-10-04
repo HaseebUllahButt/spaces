@@ -17,7 +17,7 @@ interface Props {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onDragEnd: (e: any) => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  onTransformEnd: (e: any) => void;
+  onTransformEnd?: (e: any) => void;
   width?: number;
   height?: number;
 }

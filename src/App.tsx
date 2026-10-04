@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef } from "react";
 import { Stage, Layer, Text as KonvaText, Rect, Arrow, Transformer, Group, Circle } from "react-konva";
-import jsPDF from "jspdf";
+import type Konva from "konva";
 import {
   MousePointer2,
   Type,
@@ -104,6 +104,20 @@ const App: React.FC = () => {
   const positionRef = useRef(position);
   const viewSyncTimer = useRef(0);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const [canvasSize, setCanvasSize] = React.useState(() => ({
+    width: window.innerWidth, height: Math.max(1, window.innerHeight - 48),
+  }));
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      if (width > 0 && height > 0) setCanvasSize({ width, height: Math.max(1, height - 48) });
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [boardReady]);
+
 
   React.useEffect(() => {
     if (!boardId) return;
@@ -163,7 +177,7 @@ const App: React.FC = () => {
   const groupDrag = useRef<{ anchorId: string; start: Map<string, { x: number; y: number }> } | null>(null);
   const drawStart = useRef<{ x: number; y: number; type: "rect" | "arrow" } | null>(null);
   /** Live node positions while dragging (so linked connectors follow before dragEnd). */
-  const livePos = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const livePos = useRef<Map<string, { x: number; y: number; width?: number; height?: number }>>(new Map());
   const connectorRouteRaf = useRef(0);
   const suppressClick = useRef(false);
   // Ignore blur right after opening the editor (mouseup/click after draw steals focus from the textarea).
@@ -257,7 +271,12 @@ const App: React.FC = () => {
       .map((item) => {
         const local = localUpdates.current.get(item._id);
         if (local) {
-          const allMatch = Object.entries(local).every(([k, v]) => (item as any)[k] === v);
+          const allMatch = Object.entries(local).every(([key, value]) => {
+            const remote = item[key as keyof typeof item];
+            return Array.isArray(value)
+              ? JSON.stringify(remote) === JSON.stringify(value)
+              : remote === value;
+          });
           if (allMatch) localUpdates.current.delete(item._id);
           else return { ...item, ...local };
         }
@@ -326,7 +345,7 @@ const App: React.FC = () => {
       const base = itemsById.get(id);
       if (!base) return undefined;
       const live = livePos.current.get(id);
-      return live ? { ...base, x: live.x, y: live.y } : base;
+      return live ? { ...base, ...live } : base;
     },
     [itemsById],
   );
@@ -343,6 +362,11 @@ const App: React.FC = () => {
       if (node && pts) {
         node.points(pts);
         node.position({ x: 0, y: 0 });
+        const label = stage.findOne("#connector-label-" + c._id);
+        if (label) {
+          const midpoint = pathMidpoint(pts);
+          label.position({ x: midpoint.x - label.width() / 2, y: midpoint.y - 11 });
+        }
       }
     }
     stage.batchDraw();
@@ -530,8 +554,8 @@ const App: React.FC = () => {
       commitShape("rect", {
         x: Math.min(start.x, p.x),
         y: Math.min(start.y, p.y),
-        width: Math.abs(dx),
-        height: Math.abs(dy),
+        width: Math.max(5, Math.abs(dx)),
+        height: Math.max(5, Math.abs(dy)),
       });
       return;
     }
@@ -612,6 +636,23 @@ const App: React.FC = () => {
       directed: item.directed,
       groupId: item.groupId,
       storageId: item.storageId as Id<"_storage"> | undefined,
+    });
+  };
+
+  // Use the same jointly planned paths for stored bounds and rendering. Moving
+  // an obstacle can reroute edges even when neither endpoint was selected.
+  const updateConnectorBounds = (nextItems: CanvasItem[]) => {
+    const routes = buildConnectorRoutes(nextItems);
+    return nextItems.map((item) => {
+      const points = routes.get(item._id);
+      if (!points) return item;
+      const bounds = pointsBounds(points);
+      if (item.x === bounds.x && item.y === bounds.y &&
+        item.width === bounds.width && item.height === bounds.height) return item;
+      const patched = { ...item, ...bounds };
+      localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...bounds });
+      persistItem(patched);
+      return patched;
     });
   };
 
@@ -965,6 +1006,8 @@ const App: React.FC = () => {
             cur.width !== item.width ||
             cur.height !== item.height ||
             cur.color !== item.color ||
+            cur.fontSize !== item.fontSize ||
+            cur.fontFamily !== item.fontFamily ||
             cur.zIndex !== item.zIndex ||
             cur.fromId !== item.fromId ||
             cur.toId !== item.toId ||
@@ -1098,8 +1141,10 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [boardId, toggleGrid]);
 
-  const handleExportPDF = () => {
+  const handleExportPDF = async () => {
     if (items.length === 0) return alert("Board is empty!");
+    const { default: jsPDF } = await import("jspdf");
+    if (useStore.getState().activeBoardId !== boardId || !stageRef.current) return;
     // A4 at 96dpi logical size; 2× capture keeps it crisp while JPEG keeps the file small.
     const PAGE_W = 794;
     const PAGE_H = 1123;
@@ -1398,8 +1443,8 @@ const App: React.FC = () => {
     if (dragIds.length > 1 && dragIds.includes(item._id)) {
       const start = new Map<string, { x: number; y: number }>();
       for (const id of dragIds) {
-        const it = items.find((i) => i._id === id);
-        if (it) {
+        const it = itemsById.get(id);
+        if (it && it.type !== "connector") {
           start.set(id, { x: it.x, y: it.y });
           livePos.current.set(id, { x: it.x, y: it.y });
         }
@@ -1432,14 +1477,14 @@ const App: React.FC = () => {
         if (id === item._id) return;
         const other = stage?.findOne("#" + id);
         if (other) other.position({ x: s.x + dx, y: s.y + dy });
-        const it = items.find((i) => i._id === id);
+        const it = itemsById.get(id);
         if (it?.type === "arrow") {
-          syncArrowHandles(id, s.x + dx, s.y + dy, it.width ?? 0, it.height ?? 0);
+          syncArrowHandles(id, s.x + dx, s.y + dy, it.width ?? DEFAULT_ARROW_LENGTH, it.height ?? 0);
         }
       });
       livePos.current.set(item._id, { x: e.target.x(), y: e.target.y() });
       if (item.type === "arrow") {
-        syncArrowHandles(item._id, e.target.x(), e.target.y(), item.width ?? 0, item.height ?? 0);
+        syncArrowHandles(item._id, e.target.x(), e.target.y(), item.width ?? DEFAULT_ARROW_LENGTH, item.height ?? 0);
       }
       scheduleConnectorRefresh();
       trRef.current?.forceUpdate();
@@ -1449,7 +1494,7 @@ const App: React.FC = () => {
     livePos.current.set(item._id, { x: e.target.x(), y: e.target.y() });
     // Solo arrow drag: keep endpoint dots glued to the shaft
     if (item.type === "arrow") {
-      syncArrowHandles(item._id, e.target.x(), e.target.y(), item.width ?? 0, item.height ?? 0);
+      syncArrowHandles(item._id, e.target.x(), e.target.y(), item.width ?? DEFAULT_ARROW_LENGTH, item.height ?? 0);
     }
     if (item.type === "rect") scheduleConnectorRefresh();
     stage?.batchDraw();
@@ -1471,23 +1516,11 @@ const App: React.FC = () => {
         localUpdates.current.set(id, { ...prev, ...pos });
       });
       const nextItems = items.map((i) => (moved.has(i._id) ? { ...i, ...moved.get(i._id)! } : i));
-      // Refresh connector bounds after node move (topology unchanged; auto-route updates).
-      const byId = new Map(nextItems.map((i) => [i._id, i]));
-      const withConnectors = nextItems.map((i) => {
-        if (i.type !== "connector" || !i.fromId || !i.toId || !i.fromPort || !i.toPort) return i;
-        const pts = connectorPoints(byId.get(i.fromId), byId.get(i.toId), i.fromPort, i.toPort, undefined, nextItems);
-        if (!pts) return i;
-        return { ...i, waypoints: [], ...pointsBounds(pts) };
-      });
+      const withConnectors = updateConnectorBounds(nextItems);
       setCachedItems(withConnectors);
       moved.forEach((pos, id) => {
         const it = withConnectors.find((i) => i._id === id);
         if (it) persistItem({ ...it, x: pos.x, y: pos.y });
-      });
-      withConnectors.forEach((it) => {
-        if (it.type === "connector" && (moved.has(it.fromId!) || moved.has(it.toId!))) {
-          persistItem(it);
-        }
       });
       livePos.current.clear();
       groupDrag.current = null;
@@ -1507,14 +1540,7 @@ const App: React.FC = () => {
     localUpdates.current.set(item._id, { ...prev, x: newX, y: newY });
     const movedItem = { ...item, x: newX, y: newY };
     const nextItems = items.map((i) => (i._id === item._id ? movedItem : i));
-    const byId = new Map(nextItems.map((i) => [i._id, i]));
-    const withConnectors = nextItems.map((i) => {
-      if (i.type !== "connector" || !i.fromId || !i.toId || !i.fromPort || !i.toPort) return i;
-      if (i.fromId !== item._id && i.toId !== item._id) return i;
-      const pts = connectorPoints(byId.get(i.fromId), byId.get(i.toId), i.fromPort, i.toPort, undefined, nextItems);
-      if (!pts) return i;
-      return { ...i, ...pointsBounds(pts) };
-    });
+    const withConnectors = updateConnectorBounds(nextItems);
     setCachedItems(withConnectors);
     livePos.current.clear();
     saveItemDb({
@@ -1524,11 +1550,6 @@ const App: React.FC = () => {
       boardId,
       x: newX,
       y: newY,
-    });
-    withConnectors.forEach((it) => {
-      if (it.type === "connector" && (it.fromId === item._id || it.toId === item._id)) {
-        persistItem(it);
-      }
     });
   };
 
@@ -1555,94 +1576,55 @@ const App: React.FC = () => {
     persistItem(patched);
   };
 
-  const itemTransformEnd = (e: any, item: CanvasItem) => {
-    if (!boardId) return;
-    const node = e.target;
-    const sX = node.scaleX(),
-      sY = node.scaleY();
-    node.scaleX(1);
-    node.scaleY(1);
-    const newX = node.x(),
-      newY = node.y();
-    pushUndo(boardId, items);
-    if (!hasInteracted) setHasInteracted(boardId, true);
-
-    if (item.type === "text") {
-      // Scale the font itself, then let the box hug the text at its new size.
-      const factor = Math.max(sX, sY);
-      const newFontSize = Math.max(6, Math.round((item.fontSize ?? BASE_FONT_SIZE) * factor));
-      const metrics = measureTextBox(item.content, item.fontFamily || theme.fontFamily, newFontSize);
-      const patch = {
-        x: newX,
-        y: newY,
-        width: metrics.width,
-        height: metrics.height,
-        fontSize: newFontSize,
-      };
-      localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...patch });
-      setCachedItems(items.map((i) => (i._id === item._id ? { ...i, ...patch } : i)));
-      saveItemDb({
-        id: item._id as Id<"items">,
-        type: "text",
-        content: item.content,
-        boardId,
-        ...patch,
-      });
-      return;
-    }
-
-    if (item.type === "arrow") {
-      // Scale the stored vector so the arrow keeps its direction (node.width() would drop the sign).
-      const newWidth = (item.width ?? node.width()) * sX;
-      const newHeight = (item.height ?? node.height()) * sY;
-      const patch = { x: newX, y: newY, width: newWidth, height: newHeight };
-      localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...patch });
-      setCachedItems(items.map((i) => (i._id === item._id ? { ...i, ...patch } : i)));
-      saveItemDb({
-        id: item._id as Id<"items">,
-        type: item.type,
-        content: item.content,
-        color: item.color,
-        boardId,
-        ...patch,
-      });
-      return;
-    }
-
-    // Groups (rects) don't always report reliable node.width(); prefer stored geometry.
-    const baseW = item.width ?? (item.type === "rect" ? DEFAULT_RECT_WIDTH : node.width());
-    const baseH = item.height ?? (item.type === "rect" ? DEFAULT_RECT_HEIGHT : node.height());
-    const newWidth = Math.max(5, baseW * sX);
-    const newHeight = Math.max(5, baseH * sY);
-    const patch = { x: newX, y: newY, width: newWidth, height: newHeight };
-    localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...patch });
-    const resized = { ...item, ...patch };
-    const nextItems = items.map((i) => (i._id === item._id ? resized : i));
-    const byId = new Map(nextItems.map((i) => [i._id, i]));
-    const withConnectors = nextItems.map((i) => {
-      if (i.type !== "connector" || !i.fromId || !i.toId || !i.fromPort || !i.toPort) return i;
-      if (i.fromId !== item._id && i.toId !== item._id) return i;
-      // Clear custom bends on resize so the route re-fits cleanly.
-      const pts = connectorPoints(byId.get(i.fromId), byId.get(i.toId), i.fromPort, i.toPort, [], nextItems);
-      if (!pts) return i;
-      return { ...i, waypoints: [], ...pointsBounds(pts) };
-    });
-    setCachedItems(withConnectors);
-    saveItemDb({
-      id: item._id as Id<"items">,
-      type: item.type,
-      content: item.content,
-      color: item.color,
-      fontFamily: item.fontFamily,
-      fontSize: item.fontSize,
-      boardId,
-      ...patch,
-    });
-    withConnectors.forEach((it) => {
-      if (it.type === "connector" && (it.fromId === item._id || it.toId === item._id)) {
-        persistItem(it);
+  // Commit a multi-selection resize as one edit. Per-node handlers otherwise
+  // overwrite each other using the same pre-transform React snapshot.
+  const transformedItems = (): CanvasItem[] => {
+    const nodes: Konva.Node[] = trRef.current?.nodes() ?? [];
+    return nodes.flatMap((node) => {
+      const item = itemsById.get(node.id());
+      if (!item) return [];
+      const sx = node.scaleX();
+      const sy = node.scaleY();
+      if (item.type === "text") {
+        const fontSize = Math.max(6, Math.round((item.fontSize ?? BASE_FONT_SIZE) * Math.max(sx, sy)));
+        return [{ ...item, x: node.x(), y: node.y(), fontSize,
+          ...measureTextBox(item.content, item.fontFamily || theme.fontFamily, fontSize) }];
       }
+      const width = item.width ?? (item.type === "rect" ? DEFAULT_RECT_WIDTH : node.width());
+      const height = item.height ?? (item.type === "rect" ? DEFAULT_RECT_HEIGHT : node.height());
+      return [{ ...item, x: node.x(), y: node.y(),
+        width: Math.max(5, width * sx), height: Math.max(5, height * sy) }];
     });
+  };
+
+  const selectionTransformMove = () => {
+    for (const item of transformedItems()) {
+      livePos.current.set(item._id, {
+        x: item.x, y: item.y, width: item.width, height: item.height,
+      });
+    }
+    scheduleConnectorRefresh();
+  };
+
+  const selectionTransformEnd = () => {
+    if (!boardId) return;
+    cancelConnectorRefresh();
+    const resized = transformedItems();
+    if (resized.length === 0) return;
+    const currentItems = useStore.getState().cachedItems;
+    pushUndo(boardId, currentItems);
+    if (!hasInteracted) setHasInteracted(boardId, true);
+    const byId = new Map(resized.map((item) => [item._id, item]));
+    const nodes: Konva.Node[] = trRef.current?.nodes() ?? [];
+    nodes.forEach((node) => node.scale({ x: 1, y: 1 }));
+    for (const item of resized) {
+      const patch = { x: item.x, y: item.y, width: item.width, height: item.height,
+        ...(item.type === "text" ? { fontSize: item.fontSize } : {}) };
+      localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...patch });
+      persistItem(item);
+    }
+    livePos.current.clear();
+    setCachedItems(updateConnectorBounds(currentItems.map((item) => byId.get(item._id) ?? item)));
   };
 
   // Keep keyboard/action handlers pointing at the latest implementations.
@@ -1714,7 +1696,7 @@ const App: React.FC = () => {
     if (!boardId) return;
     let patch: { x: number; y: number; width: number; height: number };
     if (which === "start") {
-      const endX = item.x + (item.width ?? 0);
+      const endX = item.x + (item.width ?? DEFAULT_ARROW_LENGTH);
       const endY = item.y + (item.height ?? 0);
       patch = { x: nx, y: ny, width: endX - nx, height: endY - ny };
     } else {
@@ -1742,14 +1724,22 @@ const App: React.FC = () => {
       });
     }
   };
+  useEffect(() => () => {
+    window.clearTimeout(viewSyncTimer.current);
+    cancelAnimationFrame(connectorRouteRaf.current);
+    connectorRouteRaf.current = 0;
+    livePos.current.clear();
+    groupDrag.current = null;
+  }, [boardId]);
+
   const editingFontSize = editingText?.fontSize ?? BASE_FONT_SIZE;
   const editingMetrics = editingText
     ? measureTextBox(editingText.content, theme.fontFamily, editingFontSize)
     : null;
   const pageGridStartX = Math.floor((-position.x / scale) / 794) - 1;
-  const pageGridEndX = Math.ceil((window.innerWidth - position.x) / scale / 794) + 1;
+  const pageGridEndX = Math.ceil((canvasSize.width - position.x) / scale / 794) + 1;
   const pageGridStartY = Math.floor((-position.y / scale) / 1123) - 1;
-  const pageGridEndY = Math.ceil((window.innerHeight - 48 - position.y) / scale / 1123) + 1;
+  const pageGridEndY = Math.ceil((canvasSize.height - position.y) / scale / 1123) + 1;
 
   return (
     <div
@@ -2142,8 +2132,8 @@ const App: React.FC = () => {
 
       <div style={{ position: "absolute", top: 48, left: 0, right: 0, bottom: 0 }}>
       <Stage
-        width={window.innerWidth}
-        height={window.innerHeight - 48}
+        width={canvasSize.width}
+        height={canvasSize.height}
         onWheel={handleWheel}
         scaleX={scale}
         scaleY={scale}
@@ -2267,7 +2257,6 @@ const App: React.FC = () => {
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
                   onDragEnd={(e: any) => nodeDragEnd(e, item)}
-                  onTransformEnd={(e: any) => itemTransformEnd(e, item)}
                   onDblClick={() => {
                     if (mode === "select") startFreeTextAt(item.x, item.y, item);
                   }}
@@ -2294,7 +2283,6 @@ const App: React.FC = () => {
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
                   onDragEnd={(e: any) => nodeDragEnd(e, item)}
-                  onTransformEnd={(e: any) => itemTransformEnd(e, item)}
                 >
                   {/* Outline only; free text is placed as separate items inside the box. */}
                   <Rect
@@ -2366,7 +2354,7 @@ const App: React.FC = () => {
                     onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   />
                   {item.content && (
-                    <Group x={labelPoint.x - labelWidth / 2} y={labelPoint.y - 11} listening={false}>
+                    <Group id={`connector-label-${item._id}`} width={labelWidth} x={labelPoint.x - labelWidth / 2} y={labelPoint.y - 11} listening={false}>
                       <Rect
                         width={labelWidth}
                         height={22}
@@ -2440,7 +2428,6 @@ const App: React.FC = () => {
                 onDragStart={() => nodeDragStart(item)}
                 onDragMove={(e: any) => nodeDragMove(e, item)}
                 onDragEnd={(e: any) => nodeDragEnd(e, item)}
-                onTransformEnd={(e: any) => itemTransformEnd(e, item)}
               />
             );
           })}
@@ -2475,7 +2462,7 @@ const App: React.FC = () => {
           {mode === "select" &&
             selectedArrows.map((arrow) => {
               const color = arrow.color || theme.accentColor;
-              const endX = arrow.x + (arrow.width ?? 0);
+              const endX = arrow.x + (arrow.width ?? DEFAULT_ARROW_LENGTH);
               const endY = arrow.y + (arrow.height ?? 0);
               const r = 5.5 / scale;
               const strokeW = 1.5 / scale;
@@ -2536,6 +2523,9 @@ const App: React.FC = () => {
               anchorSize={8}
               anchorCornerRadius={2}
               rotateEnabled={false}
+              flipEnabled={false}
+              onTransform={selectionTransformMove}
+              onTransformEnd={selectionTransformEnd}
               resizeEnabled={!selectedOnlyLines}
               borderEnabled={!selectedOnlyLines}
               keepRatio={selectedIsText}

@@ -153,7 +153,17 @@ export const useStore = create<StoreState>()(
         set((state) => {
           const vp = state.boardViewports[boardId] ?? defaultViewport();
           const replace = (list: CanvasItem[]) =>
-            list.map((item) => (item._id === oldId ? { ...item, _id: newId } : item));
+            list.map((item) => {
+              if (item._id !== oldId && item.fromId !== oldId &&
+                item.toId !== oldId && item.groupId !== oldId) return item;
+              return {
+                ...item,
+                _id: item._id === oldId ? newId : item._id,
+                fromId: item.fromId === oldId ? newId : item.fromId,
+                toId: item.toId === oldId ? newId : item.toId,
+                groupId: item.groupId === oldId ? newId : item.groupId,
+              };
+            });
           return {
             cachedItems: replace(state.cachedItems),
             boardViewports: patchViewport(state.boardViewports, boardId, {
