@@ -101,8 +101,10 @@ function simplify(points: Pt[]): Pt[] {
     if (index === 0 || index === deduped.length - 1) return true;
     const before = deduped[index - 1];
     const after = deduped[index + 1];
-    const vertical = before.x === point.x && point.x === after.x;
-    const horizontal = before.y === point.y && point.y === after.y;
+    const vertical = before.x === point.x && point.x === after.x &&
+      (point.y - before.y) * (after.y - point.y) >= 0;
+    const horizontal = before.y === point.y && point.y === after.y &&
+      (point.x - before.x) * (after.x - point.x) >= 0;
     return !vertical && !horizontal;
   });
 }
@@ -146,10 +148,13 @@ function segmentConflict(a: Pt, b: Pt, occupied: RouteSegment): "overlap" | "cro
     }
     return null;
   }
-  const h = horizontal ? { a, b } : occupied;
-  const v = horizontal ? occupied : { a, b };
-  const crosses = v.a.x > Math.min(h.a.x, h.b.x) && v.a.x < Math.max(h.a.x, h.b.x) &&
-    h.a.y > Math.min(v.a.y, v.b.y) && h.a.y < Math.max(v.a.y, v.b.y);
+  // A grid splits candidate edges at occupied lanes. Include candidate endpoints
+  // or every crossing at a grid vertex escapes the crossing penalty.
+  const crosses = horizontal
+    ? occupied.a.x >= Math.min(a.x, b.x) && occupied.a.x <= Math.max(a.x, b.x) &&
+      a.y > Math.min(occupied.a.y, occupied.b.y) && a.y < Math.max(occupied.a.y, occupied.b.y)
+    : occupied.a.y >= Math.min(a.y, b.y) && occupied.a.y <= Math.max(a.y, b.y) &&
+      a.x > Math.min(occupied.a.x, occupied.b.x) && a.x < Math.max(occupied.a.x, occupied.b.x);
   return crosses ? "cross" : null;
 }
 
@@ -193,6 +198,14 @@ function routeAroundRects(
   obstacles: RouteRect[],
   occupiedSegments: RouteSegment[] = [],
 ): Pt[] {
+  // Most adjacent cards have a clear straight lane. Avoid building a visibility
+  // graph for that case, while retaining both obstacle and lane checks.
+  const directAxis = a.y === b.y ? "h" : a.x === b.x ? "v" : null;
+  if (directAxis === fromAxis && directAxis === toAxis &&
+    !obstacles.some((rect) => segmentBlocked(a, b, rect)) &&
+    !occupiedSegments.some((segment) => segmentConflict(a, b, segment))) {
+    return [a, b];
+  }
   const laneGap = 8;
   const outerX = obstacles.length > 0
     ? [Math.min(...obstacles.map((rect) => rect.left)) - PORT_STUB,
@@ -243,8 +256,10 @@ function routeAroundRects(
   const rows = new Map<number, number[]>();
   const columns = new Map<number, number[]>();
   nodes.forEach((point, index) => {
-    rows.set(point.y, [...(rows.get(point.y) ?? []), index]);
-    columns.set(point.x, [...(columns.get(point.x) ?? []), index]);
+    if (!rows.has(point.y)) rows.set(point.y, []);
+    if (!columns.has(point.x)) columns.set(point.x, []);
+    rows.get(point.y)!.push(index);
+    columns.get(point.x)!.push(index);
   });
   const connectAdjacent = (indices: number[], axis: Axis) => {
     indices.sort((left, right) =>
@@ -303,14 +318,20 @@ function routeAroundRects(
     }
     return first;
   };
+  let bestEndScore = Infinity;
   while (queue.length > 0) {
     const next = queuePop();
     if (!next) break;
+    if (next.score >= bestEndScore) break;
     const state = next.state;
     if (visited[state] || next.score !== distance[state]) continue;
     visited[state] = true;
     const nodeIndex = Math.floor(state / 2);
     const currentAxis: Axis = state % 2 === 0 ? "h" : "v";
+    if (nodeIndex === endIndex) {
+      bestEndScore = Math.min(bestEndScore, distance[state] + (currentAxis === toAxis ? 0 : 28));
+      continue;
+    }
     for (const edge of neighbors[nodeIndex]) {
       const nextState = edge.index * 2 + axisIndex(edge.axis);
       const bendCost = edge.axis === currentAxis ? 0 : 28;
@@ -329,9 +350,13 @@ function routeAroundRects(
   });
   const endState = endStates.sort((left, right) => left.score - right.score)[0].state;
   if (!Number.isFinite(distance[endState])) {
-    // The visibility graph can only fail when reserved lanes form a temporary
-    // enclosure. Keep the emergency path orthogonal so dragging never flashes
-    // a diagonal connector through cards.
+    // When lanes enclose an endpoint, allow an overlap before ever cutting
+    // through a shape. Retry the full obstacle graph without lane reservations.
+    if (occupiedSegments.length > 0) {
+      return routeAroundRects(a, b, fromAxis, toAxis, obstacles);
+    }
+    // Keep the emergency path orthogonal for degenerate or overlapping geometry
+    // where a free route cannot be found.
     const fallbackCandidates: Pt[][] = [
       [a, { x: a.x, y: b.y }, b],
       [a, { x: b.x, y: a.y }, b],
@@ -469,7 +494,8 @@ export function buildConnectorRoutes(items: CanvasItem[]): Map<string, number[]>
     if (entries.length <= 1) return 0;
     const index = entries.findIndex((entry) => entry.connectorId === connectorId && entry.role === role);
     const { w, h } = rectSize(node);
-    const available = Math.max(12, (port === "n" || port === "s" ? w : h) - 28);
+    const sideLength = port === "n" || port === "s" ? w : h;
+    const available = Math.max(0, sideLength - 2 * Math.min(14, sideLength / 4));
     const spacing = Math.min(12, available / Math.max(1, entries.length - 1));
     return (index - (entries.length - 1) / 2) * spacing;
   };
@@ -514,9 +540,9 @@ export function buildConnectorRoutes(items: CanvasItem[]): Map<string, number[]>
     );
     if (!points) continue;
     routes.set(connector._id, points);
-    // Port stubs were reserved up front. Add only the newly planned interior
-    // segments so the occupied-lane set remains small while dragging.
-    for (let index = 2; index + 5 < points.length; index += 2) {
+    // Simplification can merge a stub into the shaft, including a whole straight
+    // route. Reserve every rendered segment so those lanes are not lost.
+    for (let index = 0; index + 3 < points.length; index += 2) {
       const a = { x: points[index], y: points[index + 1] };
       const b = { x: points[index + 2], y: points[index + 3] };
       if (!samePoint(a, b)) occupiedSegments.push({ a, b });
