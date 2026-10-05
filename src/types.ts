@@ -37,6 +37,20 @@ export interface CanvasItem {
   groupId?: string;
   /** Convex storage id for full-resolution images. */
   storageId?: string;
+  /** Image: turned clockwise in 90° steps. */
+  rotation?: number;
+  /** Image: mirrored left–right / top–bottom on screen. */
+  flipX?: boolean;
+  flipY?: boolean;
+  /** Image: the part of the original picture that's kept, as 0–1 fractions. */
+  crop?: ImageCrop;
+}
+
+export interface ImageCrop {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export type { Theme };

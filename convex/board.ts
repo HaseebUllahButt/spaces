@@ -184,6 +184,10 @@ export const saveItem = mutation({
     directed: v.optional(v.boolean()),
     groupId: v.optional(v.string()),
     storageId: v.optional(v.id("_storage")),
+    rotation: v.optional(v.number()),
+    flipX: v.optional(v.boolean()),
+    flipY: v.optional(v.boolean()),
+    crop: v.optional(v.object({ x: v.number(), y: v.number(), width: v.number(), height: v.number() })),
   },
   handler: async (ctx, args) => {
     const { id, ...data } = args;
@@ -239,6 +243,10 @@ export const createCheckpoint = mutation({
         groupId,
         _id,
         storageId,
+        rotation,
+        flipX,
+        flipY,
+        crop,
       }) => ({
         type,
         x,
@@ -259,6 +267,10 @@ export const createCheckpoint = mutation({
         groupId,
         sourceId: _id,
         storageId,
+        rotation,
+        flipX,
+        flipY,
+        crop,
       }),
     );
 

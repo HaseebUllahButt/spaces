@@ -12,9 +12,16 @@ import {
   Layers,
   Paintbrush,
   Presentation,
+  Crop,
+  RotateCcw,
+  RotateCw,
+  FlipHorizontal2,
+  FlipVertical2,
 } from "lucide-react";
 import { useStore } from "./store";
 import CanvasImage from "./components/CanvasImage";
+import ImageCropper, { type ImageCropperHandle } from "./components/ImageCropper";
+import { FULL_CROP, fullImageBox, screenCropToSource } from "./imageEdits";
 import ThemePanel from "./components/ThemePanel";
 import CheckpointPanel from "./components/CheckpointPanel";
 import LayersPanel from "./components/LayersPanel";
@@ -37,6 +44,33 @@ const EMPTY_ARRAY: CanvasItem[] = [];
 const DEFAULT_TEXT_WIDTH = 360;
 const DEFAULT_TEXT_HEIGHT = 56;
 const BASE_FONT_SIZE = 20;
+
+type TextDraft = { _id?: string; x: number; y: number; fontSize?: number; content: string };
+const textDraftKey = (boardId: string) => `curate:text-draft:${boardId}`;
+
+/** Text still being typed, kept in this browser so a refresh doesn't lose it. */
+const readTextDraft = (boardId: string): TextDraft | null => {
+  try {
+    const raw = localStorage.getItem(textDraftKey(boardId));
+    return raw ? (JSON.parse(raw) as TextDraft) : null;
+  } catch {
+    return null;
+  }
+};
+const writeTextDraft = (boardId: string, draft: TextDraft | null) => {
+  try {
+    if (draft) localStorage.setItem(textDraftKey(boardId), JSON.stringify(draft));
+    else localStorage.removeItem(textDraftKey(boardId));
+  } catch {
+    // Storage can be blocked (private mode); typing still works, it just won't survive a refresh.
+  }
+};
+
+/** Image edits sent in full, so undoing back to "no edit" really clears them. */
+const imageEditFields = (item: CanvasItem) =>
+  item.type === "image"
+    ? { rotation: item.rotation ?? 0, flipX: item.flipX ?? false, flipY: item.flipY ?? false, crop: item.crop ?? FULL_CROP }
+    : {};
 const DEFAULT_RECT_WIDTH = 220;
 const DEFAULT_RECT_HEIGHT = 140;
 const DEFAULT_ARROW_LENGTH = 200;
@@ -136,10 +170,13 @@ const App: React.FC = () => {
     });
   }, [boardId, setViewportTransform]);
 
+  // Set below once the text editor exists; pan/zoom calls it to keep the text box in place.
+  const placeTextEditorRef = useRef(() => {});
   const scheduleViewSync = React.useCallback(() => {
     // Per-frame work stays off React: the stage transform is already applied
     // imperatively, and the dot-grid parallax is a direct style write. The
     // full App render (and store persist) runs once when the gesture pauses.
+    placeTextEditorRef.current();
     window.clearTimeout(viewSyncTimer.current);
     viewSyncTimer.current = window.setTimeout(() => {
       setScaleLocal(scaleRef.current);
@@ -168,14 +205,24 @@ const App: React.FC = () => {
   const trRef = useRef<any>(null);
   const stageRef = useRef<any>(null);
   const textEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const editorMetrics = useRef<{ width: number; height: number } | null>(null);
   const drawPreviewRectRef = useRef<any>(null);
   const drawPreviewArrowRef = useRef<any>(null);
   const localUpdates = useRef<Map<string, Partial<CanvasItem>>>(new Map());
   // IDs deleted optimistically but not yet confirmed by Convex — filter them out of db merges
   // so concurrent query updates don't briefly resurrect removed items.
   const pendingDeletes = useRef<Set<string>>(new Set());
-  const groupDrag = useRef<{ anchorId: string; start: Map<string, { x: number; y: number }> } | null>(null);
+  const groupDrag = useRef<{ anchorId: string; start: Map<string, { x: number; y: number }>; done?: boolean } | null>(null);
   const drawStart = useRef<{ x: number; y: number; type: "rect" | "arrow" } | null>(null);
+  /** Box-select drag on empty canvas (world coords) and the selection it adds to. */
+  const marqueeStart = useRef<{ x: number; y: number; base: string[] } | null>(null);
+  const marqueeRectRef = useRef<any>(null);
+  /** Hand-pan drag (space / middle button / touch), in screen coords. */
+  const panStart = useRef<{ px: number; py: number; x: number; y: number; fromTyping?: boolean } | null>(null);
+  const [spacePan, setSpacePan] = React.useState(false);
+  /** Image currently in crop mode. */
+  const [croppingId, setCroppingId] = React.useState<string | null>(null);
+  const cropperRef = useRef<ImageCropperHandle>(null);
   /** Live node positions while dragging (so linked connectors follow before dragEnd). */
   const livePos = useRef<Map<string, { x: number; y: number; width?: number; height?: number }>>(new Map());
   const connectorRouteRaf = useRef(0);
@@ -186,11 +233,14 @@ const App: React.FC = () => {
   const itemsRef = useRef<CanvasItem[]>([]);
   const selectedIdsRef = useRef<string[]>([]);
   const editingTextRef = useRef(editingText);
+  const croppingRef = useRef<string | null>(null);
   const modeRef = useRef(mode);
   const actionRefs = useRef({
     deleteItems: (_ids: string[]) => {},
     reconcileHistory: async (_target: CanvasItem[]) => {},
     adjustFontSize: (_delta: number) => {},
+    finishCrop: (_apply: boolean) => {},
+    wheel: (_e: { evt: WheelEvent }) => {},
   });
 
   useEffect(() => {
@@ -199,13 +249,45 @@ const App: React.FC = () => {
 
   const resizeTextEditor = (textarea = textEditorRef.current, value = editingText?.content ?? "") => {
     if (!textarea || !editingText) return;
-    const metrics = measureTextBox(value, theme.fontFamily, editingText.fontSize ?? BASE_FONT_SIZE);
-    textarea.style.width = `${metrics.width * scale}px`;
-    textarea.style.height = `${metrics.height * scale}px`;
+    editorMetrics.current = measureTextBox(value, theme.fontFamily, editingText.fontSize ?? BASE_FONT_SIZE);
+    placeTextEditor();
+  };
+
+  /** Keep the open text box pinned to its spot on the canvas at the live pan/zoom. */
+  const placeTextEditor = () => {
+    const textarea = textEditorRef.current;
+    const editing = editingTextRef.current;
+    if (!textarea || !editing) return;
+    const s = scaleRef.current;
+    const pos = positionRef.current;
+    textarea.style.left = `${editing.x * s + pos.x}px`;
+    textarea.style.top = `${editing.y * s + pos.y}px`;
+    textarea.style.fontSize = `${(editing.fontSize ?? BASE_FONT_SIZE) * s}px`;
+    const m = editorMetrics.current;
+    if (m) {
+      textarea.style.width = `${m.width * s}px`;
+      textarea.style.height = `${m.height * s}px`;
+    }
+  };
+  placeTextEditorRef.current = placeTextEditor;
+
+  const saveTextDraft = () => {
+    const editing = editingTextRef.current;
+    if (!boardId || !editing) return;
+    writeTextDraft(boardId, {
+      _id: editing._id,
+      x: editing.x,
+      y: editing.y,
+      fontSize: editing.fontSize,
+      content: textEditorRef.current?.value ?? editing.content,
+    });
   };
 
   useLayoutEffect(() => {
-    if (editingText) resizeTextEditor();
+    if (editingText) {
+      resizeTextEditor(textEditorRef.current, textEditorRef.current?.value ?? editingText.content);
+      saveTextDraft();
+    }
   }, [editingText?.x, editingText?.y, editingText?.fontSize, scale, theme.fontFamily]);
 
   /** Place a free-floating text cursor at world coords (works on empty canvas or inside a rect). */
@@ -273,7 +355,7 @@ const App: React.FC = () => {
         if (local) {
           const allMatch = Object.entries(local).every(([key, value]) => {
             const remote = item[key as keyof typeof item];
-            return Array.isArray(value)
+            return typeof value === "object" && value !== null
               ? JSON.stringify(remote) === JSON.stringify(value)
               : remote === value;
           });
@@ -295,9 +377,35 @@ const App: React.FC = () => {
   }, [dbItems, setCachedItems]);
 
   const items = cachedItems.length > 0 || dbItems !== undefined ? cachedItems : EMPTY_ARRAY;
+
+  const draftRestoredFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!boardId || dbItems === undefined || draftRestoredFor.current === boardId) return;
+    draftRestoredFor.current = boardId;
+    const draft = readTextDraft(boardId);
+    if (!draft) return;
+    // Reopen as new text if the original was never saved or has since been removed.
+    const stillThere = draft._id && dbItems.some((item) => item._id === draft._id);
+    ignoreBlurUntil.current = Date.now() + 400;
+    setEditingText({
+      _id: stillThere ? draft._id : undefined,
+      x: draft.x,
+      y: draft.y,
+      content: draft.content,
+      fontSize: draft.fontSize ?? BASE_FONT_SIZE,
+      itemType: "text",
+    });
+    window.setTimeout(() => {
+      const el = textEditorRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    }, 10);
+  }, [boardId, dbItems]);
   itemsRef.current = items;
   selectedIdsRef.current = selectedIds;
   editingTextRef.current = editingText;
+  croppingRef.current = croppingId;
   modeRef.current = mode;
 
   // Stable render order: ascending zIndex (front-most drawn last), ties keep insertion order.
@@ -391,6 +499,25 @@ const App: React.FC = () => {
     e.evt.preventDefault();
     const stage = stageRef.current;
     if (!stage) return;
+    const evt: WheelEvent = e.evt;
+    // Line-mode wheels (Firefox mouse) report ~3 per notch; normalise to pixels.
+    const unit = evt.deltaMode === 1 ? 16 : 1;
+    let deltaX = evt.deltaX * unit;
+    let deltaY = evt.deltaY * unit;
+    // Two-finger scroll / mouse wheel pans; pinch (sent as ctrl+wheel) or ctrl+wheel zooms.
+    if (!evt.ctrlKey && !evt.metaKey) {
+      if (evt.shiftKey && deltaX === 0) {
+        deltaX = deltaY;
+        deltaY = 0;
+      }
+      const newPos = { x: stage.x() - deltaX, y: stage.y() - deltaY };
+      stage.position(newPos);
+      stage.batchDraw();
+      positionRef.current = newPos;
+      scheduleViewSync();
+      if (!hasInteracted) setHasInteracted(boardId, true);
+      return;
+    }
     const oldScale = stage.scaleX();
     const pointer = stage.getPointerPosition();
     if (!pointer) return;
@@ -398,7 +525,9 @@ const App: React.FC = () => {
       x: (pointer.x - stage.x()) / oldScale,
       y: (pointer.y - stage.y()) / oldScale,
     };
-    const newScale = Math.min(Math.max(e.evt.deltaY < 0 ? oldScale * 1.08 : oldScale / 1.08, 0.1), 5);
+    // Small pinch deltas give smooth zoom; big mouse-wheel notches are capped to one step.
+    const step = Math.max(-10, Math.min(10, deltaY));
+    const newScale = Math.min(Math.max(oldScale * Math.exp(-step * 0.02), 0.1), 5);
     const newPos = {
       x: pointer.x - mousePointTo.x * newScale,
       y: pointer.y - mousePointTo.y * newScale,
@@ -421,6 +550,12 @@ const App: React.FC = () => {
     }
     if (!boardId) return;
 
+    // Clicking off the picture while cropping keeps the crop.
+    if (croppingId) {
+      if (e.target === stageRef.current) finishCrop(true);
+      return;
+    }
+
     // Text tool: place free text at the click — including when the click lands on a rectangle.
     if (mode === "text") {
       const p = worldPointer();
@@ -440,10 +575,22 @@ const App: React.FC = () => {
 
   const handleStageDblClick = (e: any) => {
     if (!boardId) return;
-    // Double-click anywhere (canvas or inside a shape) → free text at that point.
+    e.cancelBubble = true;
+    // Double-click on existing text → edit it.
+    const hit = items.find((i) => i._id === e.target?.id?.());
+    if (hit?.type === "text") {
+      startFreeTextAt(hit.x, hit.y, hit);
+      return;
+    }
+    // Double-click on a picture → crop it.
+    if (hit?.type === "image" && mode === "select") {
+      startCrop(hit._id);
+      return;
+    }
+    if (croppingId) return;
+    // Double-click anywhere else (canvas or inside a shape) → free text at that point.
     const p = worldPointer();
     if (!p) return;
-    e.cancelBubble = true;
     startFreeTextAt(p.x, p.y);
   };
 
@@ -467,8 +614,34 @@ const App: React.FC = () => {
     }
   };
 
-  const handleStageMouseDown = () => {
+  const handleStageMouseDown = (e: any) => {
     suppressClick.current = false;
+    const stage = stageRef.current;
+    const evt = e?.evt;
+    const isTouch = typeof TouchEvent !== "undefined" && evt instanceof TouchEvent;
+    const onEmpty = e?.target === stage;
+    // Hand pan: middle button, space held, or a finger on empty canvas.
+    if (stage && (evt?.button === 1 || spacePan || (isTouch && onEmpty && mode === "select"))) {
+      evt?.preventDefault?.();
+      const p = stage.getPointerPosition();
+      if (p) panStart.current = { px: p.x, py: p.y, x: stage.x(), y: stage.y() };
+      return;
+    }
+    // While typing, dragging empty canvas looks around without closing the text.
+    if (stage && editingTextRef.current && onEmpty && evt?.button === 0) {
+      evt.preventDefault();
+      const p = stage.getPointerPosition();
+      if (p) panStart.current = { px: p.x, py: p.y, x: stage.x(), y: stage.y(), fromTyping: true };
+      return;
+    }
+    // Drag on empty canvas with the select tool draws a selection box.
+    if (mode === "select" && onEmpty && evt?.button === 0 && !croppingId) {
+      const p = worldPointer();
+      if (!p) return;
+      const additive = Boolean(evt.shiftKey || evt.ctrlKey || evt.metaKey);
+      marqueeStart.current = { ...p, base: additive ? selectedIds : [] };
+      return;
+    }
     if (mode !== "rect" && mode !== "arrow") return;
     const p = worldPointer();
     if (!p) return;
@@ -489,7 +662,41 @@ const App: React.FC = () => {
     }
   };
 
-  const handleStageMouseMove = () => {
+  const handleStageMouseMove = (e: any) => {
+    const stage = stageRef.current;
+    const pan = panStart.current;
+    if (pan && stage) {
+      // Button released outside the canvas — stop panning.
+      if (e?.evt?.buttons === 0) {
+        panStart.current = null;
+        return;
+      }
+      const p = stage.getPointerPosition();
+      if (!p) return;
+      const newPos = { x: pan.x + p.x - pan.px, y: pan.y + p.y - pan.py };
+      stage.position(newPos);
+      stage.batchDraw();
+      positionRef.current = newPos;
+      scheduleViewSync();
+      return;
+    }
+    const box = marqueeStart.current;
+    if (box && marqueeRectRef.current) {
+      if (e?.evt?.buttons === 0) {
+        marqueeStart.current = null;
+        marqueeRectRef.current.visible(false);
+        marqueeRectRef.current.getLayer()?.batchDraw();
+        return;
+      }
+      const p = worldPointer();
+      if (!p) return;
+      const r = marqueeRectRef.current;
+      r.visible(true);
+      r.position({ x: Math.min(box.x, p.x), y: Math.min(box.y, p.y) });
+      r.size({ width: Math.abs(p.x - box.x), height: Math.abs(p.y - box.y) });
+      r.getLayer()?.batchDraw();
+      return;
+    }
     const start = drawStart.current;
     if (!start) return;
     const p = worldPointer();
@@ -530,7 +737,69 @@ const App: React.FC = () => {
     return best;
   };
 
+  /** Select everything that sits fully inside the box drawn on the canvas. */
+  const finishMarquee = () => {
+    const box = marqueeStart.current;
+    marqueeStart.current = null;
+    const r = marqueeRectRef.current;
+    const stage = stageRef.current;
+    if (!box || !r || !stage) return;
+    const wasVisible = r.visible();
+    // Barely moved: treat as a plain click (clears selection via the click handler).
+    const tiny = r.width() * scaleRef.current < 4 && r.height() * scaleRef.current < 4;
+    if (!wasVisible || tiny) {
+      r.visible(false);
+      r.getLayer()?.batchDraw();
+      return;
+    }
+    suppressClick.current = true;
+    // Measure the box and items the same way so zoom/pan never skews the match.
+    const area = r.getClientRect({ skipStroke: true });
+    const left = area.x;
+    const top = area.y;
+    const right = area.x + area.width;
+    const bottom = area.y + area.height;
+    const picked = new Set(box.base);
+    // Measure before hiding: a hidden node reports an empty box.
+    r.visible(false);
+    r.getLayer()?.batchDraw();
+    for (const item of items) {
+      const node = stage.findOne("#" + item._id);
+      if (!node) continue;
+      const b = node.getClientRect();
+      if (b.x >= left && b.y >= top && b.x + b.width <= right && b.y + b.height <= bottom) {
+        picked.add(item._id);
+        // A boxed frame brings its contents along, like clicking it does.
+        if (item.type === "frame") {
+          for (const child of items) if (child.groupId === item._id) picked.add(child._id);
+        }
+      }
+    }
+    setSelectedIds([...picked]);
+    if (boardId && !hasInteracted) setHasInteracted(boardId, true);
+  };
+
   const handleStageMouseUp = () => {
+    const pan = panStart.current;
+    if (pan) {
+      panStart.current = null;
+      if (pan.fromTyping) {
+        // The trailing click mustn't start new text or clear anything.
+        suppressClick.current = true;
+        // A click (not a drag) on the canvas while typing finishes the text, as before.
+        const stage = stageRef.current;
+        if (stage && Math.abs(stage.x() - pan.x) < 3 && Math.abs(stage.y() - pan.y) < 3) {
+          textEditorRef.current?.blur();
+          return;
+        }
+      }
+      if (boardId && !hasInteracted) setHasInteracted(boardId, true);
+      return;
+    }
+    if (marqueeStart.current) {
+      finishMarquee();
+      return;
+    }
     const start = drawStart.current;
     if (!start) return;
     drawStart.current = null;
@@ -636,6 +905,7 @@ const App: React.FC = () => {
       directed: item.directed,
       groupId: item.groupId,
       storageId: item.storageId as Id<"_storage"> | undefined,
+      ...imageEditFields(item),
     });
   };
 
@@ -917,9 +1187,14 @@ const App: React.FC = () => {
     persistItem({ ...item, color });
   };
 
+  /** Resize the text being typed, or every selected text. */
   const adjustSelectedFontSize = (delta: number) => {
     if (!boardId) return;
-    if (selectedIdsRef.current.length !== 1) return;
+    const clamp = (size: number) => Math.max(6, Math.min(160, Math.round(size)));
+    if (editingTextRef.current) {
+      setEditingText((prev) => prev && { ...prev, fontSize: clamp((prev.fontSize ?? BASE_FONT_SIZE) + delta) });
+      return;
+    }
     const targets = items.filter(
       (item) => selectedIdsRef.current.includes(item._id) &&
         item.type === "text",
@@ -928,7 +1203,7 @@ const App: React.FC = () => {
     pushUndo(boardId, items);
     const patchedById = new Map<string, CanvasItem>();
     for (const item of targets) {
-      const fontSize = Math.max(6, Math.min(160, (item.fontSize ?? BASE_FONT_SIZE) + delta));
+      const fontSize = clamp((item.fontSize ?? BASE_FONT_SIZE) + delta);
       const patch: Partial<CanvasItem> = { fontSize };
       if (item.type === "text") {
         const metrics = measureTextBox(item.content, item.fontFamily || theme.fontFamily, fontSize);
@@ -990,6 +1265,7 @@ const App: React.FC = () => {
           directed: item.directed,
           groupId: item.groupId ? idMap.get(item.groupId) : undefined,
           storageId: item.storageId as Id<"_storage"> | undefined,
+          ...imageEditFields(item),
           boardId,
       });
       idMap.set(item._id, newId);
@@ -1015,6 +1291,7 @@ const App: React.FC = () => {
             cur.toPort !== item.toPort ||
             cur.directed !== item.directed ||
             cur.groupId !== item.groupId ||
+            JSON.stringify(imageEditFields(cur)) !== JSON.stringify(imageEditFields(item)) ||
             JSON.stringify(cur.waypoints) !== JSON.stringify(item.waypoints))
         ) {
           saveItemDb({
@@ -1037,6 +1314,7 @@ const App: React.FC = () => {
             directed: item.directed,
             groupId: item.groupId ? (idMap.get(item.groupId) ?? item.groupId) : undefined,
             storageId: item.storageId as Id<"_storage"> | undefined,
+            ...imageEditFields(item),
             boardId,
           });
         }
@@ -1064,11 +1342,24 @@ const App: React.FC = () => {
       if (document.activeElement?.tagName === "INPUT" || document.activeElement?.tagName === "TEXTAREA")
         return;
       if (!boardId) return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (!e.repeat) setSpacePan(true);
+        return;
+      }
+      // Crop mode only listens for Enter (keep) and Escape (cancel).
+      if (croppingRef.current) {
+        if (e.key === "Enter" || e.key === "Escape") {
+          e.preventDefault();
+          actionRefs.current.finishCrop(e.key === "Enter");
+        }
+        return;
+      }
       const itemsNow = itemsRef.current;
       const selectedNow = selectedIdsRef.current;
 
       if (
-        ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === ">" || e.key === "<")) ||
+        ((e.ctrlKey || e.metaKey) && ["[", "]", "<", ">"].includes(e.key)) ||
         (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "]" || e.key === "["))
       ) {
         e.preventDefault();
@@ -1135,8 +1426,18 @@ const App: React.FC = () => {
         actionRefs.current.deleteItems(selectedNow);
       }
     };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") setSpacePan(false);
+    };
+    const handleBlur = () => setSpacePan(false);
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+    };
     // Stable listener: reads latest values via refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [boardId, toggleGrid]);
@@ -1312,25 +1613,25 @@ const App: React.FC = () => {
       window.setTimeout(() => textEditorRef.current?.focus(), 0);
       return;
     }
+    writeTextDraft(boardId, null);
     // Prefer live DOM value so the last keystroke is never lost to a stale render.
     const content = textEditorRef.current?.value ?? editingText.content;
     const isTemp = editingText._id && String(editingText._id).startsWith("temp-");
     const isReal = editingText._id && !isTemp;
-    const metrics = measureTextBox(content, theme.fontFamily, editingText.fontSize ?? BASE_FONT_SIZE);
+    const fontSize = editingText.fontSize ?? BASE_FONT_SIZE;
+    const metrics = measureTextBox(content, theme.fontFamily, fontSize);
     if (content.trim().length > 0) {
       if (isReal) {
+        const existing = items.find((i) => i._id === editingText._id);
+        // A size change while typing re-fits the box; otherwise it only grows.
+        const fontChanged = (existing?.fontSize ?? BASE_FONT_SIZE) !== fontSize;
+        const width = fontChanged ? metrics.width : Math.max(existing?.width || 0, metrics.width);
+        const height = fontChanged ? metrics.height : Math.max(existing?.height || 0, metrics.height);
         pushUndo(boardId, items);
-        localUpdates.current.set(editingText._id!, { content });
+        localUpdates.current.set(editingText._id!, { content, fontSize, width, height });
         setCachedItems(
           items.map((i) =>
-            i._id === editingText._id
-              ? {
-                  ...i,
-                  content,
-                  width: Math.max(i.width || 0, metrics.width),
-                  height: Math.max(i.height || 0, metrics.height),
-                }
-              : i,
+            i._id === editingText._id ? { ...i, content, fontSize, width, height } : i,
           ),
         );
         saveItemDb({
@@ -1340,8 +1641,9 @@ const App: React.FC = () => {
           boardId,
           x: editingText.x,
           y: editingText.y,
-          width: Math.max(items.find((i) => i._id === editingText._id)?.width || 0, metrics.width),
-          height: Math.max(items.find((i) => i._id === editingText._id)?.height || 0, metrics.height),
+          width,
+          height,
+          fontSize,
         });
       } else {
         const tempId = `temp-${Date.now()}`;
@@ -1359,6 +1661,7 @@ const App: React.FC = () => {
             height: metrics.height,
             content,
             fontFamily: theme.fontFamily,
+            fontSize,
             color: theme.textColor,
             zIndex,
           },
@@ -1371,6 +1674,7 @@ const App: React.FC = () => {
           height: metrics.height,
           content,
           fontFamily: theme.fontFamily,
+          fontSize,
           color: theme.textColor,
           zIndex,
           boardId,
@@ -1399,6 +1703,7 @@ const App: React.FC = () => {
   };
 
   const itemPointerDown = (id: string, e?: any) => {
+    if (croppingId && id !== croppingId) finishCrop(true);
     if (formatPainterActive && formatStyle && boardId) {
       if (e) e.cancelBubble = true;
       const target = itemsById.get(id);
@@ -1435,6 +1740,9 @@ const App: React.FC = () => {
   };
 
   const nodeDragStart = (item: CanvasItem) => {
+    // The selection box starts drags on the other selected items too; they're
+    // already part of the move the first item kicked off.
+    if (groupDrag.current?.start.has(item._id)) return;
     livePos.current.set(item._id, { x: item.x, y: item.y });
     const frameId = item.type === "frame" ? item._id : undefined;
     const dragIds = frameId
@@ -1467,6 +1775,8 @@ const App: React.FC = () => {
   const nodeDragMove = (e: any, item: CanvasItem) => {
     const g = groupDrag.current;
     const stage = stageRef.current;
+    // Followers are positioned by the item that started the group move.
+    if (g && g.anchorId !== item._id && g.start.has(item._id)) return;
     if (g && g.anchorId === item._id) {
       const anchorStart = g.start.get(item._id);
       if (!anchorStart) return;
@@ -1503,10 +1813,18 @@ const App: React.FC = () => {
   const nodeDragEnd = (e: any, item: CanvasItem) => {
     cancelConnectorRefresh();
     const g = groupDrag.current;
-    if (g && g.anchorId === item._id && boardId) {
-      const anchorStart = g.start.get(item._id)!;
-      const dx = e.target.x() - anchorStart.x;
-      const dy = e.target.y() - anchorStart.y;
+    if (g && g.start.has(item._id) && boardId) {
+      // Every moved item reports its own drag end; save the whole group once.
+      if (g.done) return;
+      g.done = true;
+      window.setTimeout(() => {
+        if (groupDrag.current === g) groupDrag.current = null;
+      }, 0);
+      const anchorNode = item._id === g.anchorId ? e.target : stageRef.current?.findOne("#" + g.anchorId);
+      const refNode = anchorNode ?? e.target;
+      const refStart = g.start.get(anchorNode ? g.anchorId : item._id)!;
+      const dx = refNode.x() - refStart.x;
+      const dy = refNode.y() - refStart.y;
       pushUndo(boardId, items);
       if (!hasInteracted) setHasInteracted(boardId, true);
       const moved = new Map<string, { x: number; y: number }>();
@@ -1523,7 +1841,6 @@ const App: React.FC = () => {
         if (it) persistItem({ ...it, x: pos.x, y: pos.y });
       });
       livePos.current.clear();
-      groupDrag.current = null;
       return;
     }
     groupDrag.current = null;
@@ -1630,7 +1947,89 @@ const App: React.FC = () => {
   // Keep keyboard/action handlers pointing at the latest implementations.
   actionRefs.current.deleteItems = deleteItems;
   actionRefs.current.reconcileHistory = reconcileHistory;
+  /** Apply an edit to each selected picture as one undo step. */
+  const editSelectedImages = (edit: (item: CanvasItem) => Partial<CanvasItem>) => {
+    if (!boardId) return;
+    const targets = items.filter((item) => selectedIds.includes(item._id) && item.type === "image");
+    if (targets.length === 0) return;
+    pushUndo(boardId, items);
+    if (!hasInteracted) setHasInteracted(boardId, true);
+    const patchedById = new Map<string, CanvasItem>();
+    for (const item of targets) {
+      const patch = edit(item);
+      patchedById.set(item._id, { ...item, ...patch });
+      localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...patch });
+      persistItem({ ...item, ...patch });
+    }
+    setCachedItems(items.map((item) => patchedById.get(item._id) ?? item));
+  };
+
+  /** Turn pictures a quarter turn (1 = clockwise), keeping each centred. */
+  const rotateSelectedImages = (direction: 1 | -1) =>
+    editSelectedImages((item) => {
+      // A picture mirrored on one axis turns the other way underneath.
+      const step = item.flipX !== item.flipY ? -direction : direction;
+      const w = item.width ?? 0;
+      const h = item.height ?? 0;
+      return {
+        rotation: (((item.rotation ?? 0) + step * 90) % 360 + 360) % 360,
+        x: item.x + (w - h) / 2,
+        y: item.y + (h - w) / 2,
+        width: h,
+        height: w,
+      };
+    });
+
+  const flipSelectedImages = (axis: "x" | "y") =>
+    editSelectedImages((item) => (axis === "x" ? { flipX: !item.flipX } : { flipY: !item.flipY }));
+
+  const startCrop = (id: string) => {
+    setSelectedIds([id]);
+    setCroppingId(id);
+  };
+
+  /** Leave crop mode, saving the new crop unless cancelled. */
+  const finishCrop = (apply: boolean) => {
+    const item = croppingId ? itemsById.get(croppingId) : undefined;
+    const box = cropperRef.current?.getBox();
+    setCroppingId(null);
+    if (!apply || !item || !box || !boardId) return;
+    const area = fullImageBox(item);
+    const onScreen = {
+      x: (box.x - area.x) / area.width,
+      y: (box.y - area.y) / area.height,
+      width: box.width / area.width,
+      height: box.height / area.height,
+    };
+    const patch: Partial<CanvasItem> = {
+      crop: screenCropToSource(onScreen, item),
+      x: box.x,
+      y: box.y,
+      width: box.width,
+      height: box.height,
+    };
+    pushUndo(boardId, items);
+    localUpdates.current.set(item._id, { ...(localUpdates.current.get(item._id) ?? {}), ...patch });
+    setCachedItems(items.map((i) => (i._id === item._id ? { ...i, ...patch } : i)));
+    persistItem({ ...item, ...patch });
+  };
+
   actionRefs.current.adjustFontSize = adjustSelectedFontSize;
+  actionRefs.current.finishCrop = finishCrop;
+  actionRefs.current.wheel = handleWheel;
+
+  // Scrolling or pinching over the open text box moves the canvas like anywhere else.
+  const editorKey = editingText ? (editingText._id ?? `new-${editingText.x}-${editingText.y}`) : null;
+  useEffect(() => {
+    const el = textEditorRef.current;
+    if (!el || !editorKey) return;
+    const onWheel = (e: WheelEvent) => {
+      stageRef.current?.setPointersPositions(e);
+      actionRefs.current.wheel({ evt: e });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [editorKey]);
 
   const zoomPct = Math.round(scale * 100);
   const selectedIsText =
@@ -1665,10 +2064,8 @@ const App: React.FC = () => {
     const item = itemsById.get(id);
     return item?.type === "frame" || Boolean(item?.groupId);
   });
-  const canAdjustFontSize = selectedIds.some((id) => {
-    return selectedIds.length === 1 && itemsById.get(id)?.type === "text";
-  });
   const singleSelectedItem = selectedIds.length === 1 ? itemsById.get(selectedIds[0]) : undefined;
+  const selectedImageCount = selectedIds.filter((id) => itemsById.get(id)?.type === "image").length;
   const canCopyStyle = Boolean(
     singleSelectedItem && singleSelectedItem.type !== "connector" && singleSelectedItem.type !== "frame",
   );
@@ -1750,8 +2147,9 @@ const App: React.FC = () => {
         backgroundColor: theme.backgroundColor,
         overflow: "hidden",
         transition: "background-color 0.4s ease",
-        cursor:
-          formatPainterActive || mode === "text" || mode === "rect" || mode === "arrow"
+        cursor: spacePan
+          ? "grab"
+          : formatPainterActive || mode === "text" || mode === "rect" || mode === "arrow"
             ? "crosshair"
             : "default",
       }}
@@ -1923,26 +2321,44 @@ const App: React.FC = () => {
             />
           )}
 
-          {canAdjustFontSize && (
+          {croppingId ? (
             <>
-              <button
-                className="tool-btn"
-                onClick={() => adjustSelectedFontSize(-2)}
-                title="Decrease font size · ["
-                aria-label="Decrease font size"
-                style={{ minWidth: 32, paddingInline: 8 }}
-              >
-                A−
+              <button className="tool-btn" onClick={() => cropperRef.current?.reset()} title="Show the whole picture again">
+                reset
               </button>
-              <button
-                className="tool-btn"
-                onClick={() => adjustSelectedFontSize(2)}
-                title="Increase font size · ]"
-                aria-label="Increase font size"
-                style={{ minWidth: 32, paddingInline: 8 }}
-              >
-                A+
+              <button className="tool-btn" onClick={() => finishCrop(false)} title="Cancel · Esc">
+                cancel
               </button>
+              <button className="tool-btn active" onClick={() => finishCrop(true)} title="Keep this crop · Enter">
+                done
+              </button>
+              <div className="toolbar-divider" />
+            </>
+          ) : selectedImageCount > 0 && (
+            <>
+              {selectedImageCount === 1 && selectedIds.length === 1 && (
+                <button
+                  className="tool-btn icon-only"
+                  onClick={() => startCrop(selectedIds[0])}
+                  title="Crop · or double-click the picture"
+                  aria-label="Crop"
+                >
+                  <Crop size={15} />
+                </button>
+              )}
+              <button className="tool-btn icon-only" onClick={() => rotateSelectedImages(-1)} title="Turn left" aria-label="Turn left">
+                <RotateCcw size={15} />
+              </button>
+              <button className="tool-btn icon-only" onClick={() => rotateSelectedImages(1)} title="Turn right" aria-label="Turn right">
+                <RotateCw size={15} />
+              </button>
+              <button className="tool-btn icon-only" onClick={() => flipSelectedImages("x")} title="Mirror left–right" aria-label="Mirror left to right">
+                <FlipHorizontal2 size={15} />
+              </button>
+              <button className="tool-btn icon-only" onClick={() => flipSelectedImages("y")} title="Mirror top–bottom" aria-label="Mirror top to bottom">
+                <FlipVertical2 size={15} />
+              </button>
+              <div className="toolbar-divider" />
             </>
           )}
 
@@ -2139,7 +2555,6 @@ const App: React.FC = () => {
         scaleY={scale}
         x={position.x}
         y={position.y}
-        draggable={mode === "select" && !editingText}
         ref={stageRef}
         onClick={handleStageClick}
         onDblClick={handleStageDblClick}
@@ -2149,15 +2564,6 @@ const App: React.FC = () => {
         onTouchStart={handleStageMouseDown}
         onTouchMove={handleStageMouseMove}
         onTouchEnd={handleStageMouseUp}
-        onDragEnd={(e: any) => {
-          if (e.target === stageRef.current) {
-            const pos = { x: e.target.x(), y: e.target.y() };
-            positionRef.current = pos;
-            setPositionLocal(pos);
-            flushViewToStore();
-            if (!hasInteracted) setHasInteracted(boardId, true);
-          }
-        }}
       >
         <Layer perfectDrawEnabled={false}>
           {showGrid &&
@@ -2192,7 +2598,7 @@ const App: React.FC = () => {
                   id={item._id}
                   x={item.x}
                   y={item.y}
-                  draggable={mode === "select"}
+                  draggable={mode === "select" && !spacePan}
                   onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
@@ -2252,14 +2658,11 @@ const App: React.FC = () => {
                   perfectDrawEnabled={false}
                   shadowForStrokeEnabled={false}
                   hitStrokeWidth={0}
-                  draggable={mode === "select"}
+                  draggable={mode === "select" && !spacePan}
                   onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
                   onDragEnd={(e: any) => nodeDragEnd(e, item)}
-                  onDblClick={() => {
-                    if (mode === "select") startFreeTextAt(item.x, item.y, item);
-                  }}
                 />
               );
             }
@@ -2278,7 +2681,7 @@ const App: React.FC = () => {
                   id={item._id}
                   x={item.x}
                   y={item.y}
-                  draggable={mode === "select"}
+                  draggable={mode === "select" && !spacePan}
                   onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
@@ -2401,7 +2804,7 @@ const App: React.FC = () => {
                   hitStrokeWidth={22}
                   perfectDrawEnabled={false}
                   shadowForStrokeEnabled={false}
-                  draggable={mode === "select"}
+                  draggable={mode === "select" && !spacePan}
                   onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                   onDragStart={() => nodeDragStart(item)}
                   onDragMove={(e: any) => nodeDragMove(e, item)}
@@ -2414,6 +2817,19 @@ const App: React.FC = () => {
             // letting them fall through to the image renderer.
             if (item.type !== "image") return null;
 
+            if (croppingId === item._id) {
+              return (
+                <ImageCropper
+                  key={item._id}
+                  ref={cropperRef}
+                  item={item}
+                  accentColor={theme.accentColor}
+                  surfaceColor={theme.surfaceColor}
+                  scale={scale}
+                />
+              );
+            }
+
             return (
               <CanvasImage
                 key={item._id}
@@ -2423,7 +2839,11 @@ const App: React.FC = () => {
                 url={item.content}
                 width={item.width}
                 height={item.height}
-                draggable={mode === "select"}
+                rotation={item.rotation}
+                flipX={item.flipX}
+                flipY={item.flipY}
+                crop={item.crop}
+                draggable={mode === "select" && !spacePan}
                 onPointerDown={(e: any) => itemPointerDown(item._id, e)}
                 onDragStart={() => nodeDragStart(item)}
                 onDragMove={(e: any) => nodeDragMove(e, item)}
@@ -2456,6 +2876,15 @@ const App: React.FC = () => {
             pointerWidth={11}
             lineCap="round"
             lineJoin="round"
+            perfectDrawEnabled={false}
+          />
+          <Rect
+            ref={marqueeRectRef}
+            visible={false}
+            listening={false}
+            stroke={theme.accentColor}
+            strokeWidth={1 / scale}
+            fill={`${theme.accentColor}14`}
             perfectDrawEnabled={false}
           />
           {/* Free-arrow endpoint handles — two small dots instead of a cluttered resize box */}
@@ -2512,7 +2941,7 @@ const App: React.FC = () => {
               );
             })}
 
-          {mode === "select" && selectedIds.length > 0 && (
+          {mode === "select" && selectedIds.length > 0 && !croppingId && (
             <Transformer
               ref={trRef}
               borderStroke={theme.accentColor}
@@ -2556,7 +2985,7 @@ const App: React.FC = () => {
       {/* Free-floating HTML text editor — placed at the click, including inside rectangles. */}
       {editingText && (
         <textarea
-          key={editingText._id ?? `new-${editingText.x}-${editingText.y}`}
+          key={editorKey ?? undefined}
           ref={textEditorRef}
           autoFocus
           wrap="off"
@@ -2591,12 +3020,21 @@ const App: React.FC = () => {
           onBlur={handleTextBlur}
           onKeyDown={(e) => {
             e.stopPropagation();
+            // Ctrl+[ / Ctrl+] or Ctrl+Shift+< / > resize while typing.
+            if ((e.ctrlKey || e.metaKey) && ["[", "]", "<", ">"].includes(e.key)) {
+              e.preventDefault();
+              adjustSelectedFontSize(e.key === "]" || e.key === ">" ? 2 : -2);
+              return;
+            }
             if (e.key === "Escape") {
               ignoreBlurUntil.current = 0;
               e.currentTarget.blur();
             }
           }}
-          onInput={(e) => resizeTextEditor(e.currentTarget, e.currentTarget.value)}
+          onInput={(e) => {
+            resizeTextEditor(e.currentTarget, e.currentTarget.value);
+            saveTextDraft();
+          }}
         />
       )}
       </div>

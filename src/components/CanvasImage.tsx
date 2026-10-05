@@ -1,6 +1,8 @@
-import { forwardRef } from 'react';
+import { forwardRef, useMemo } from 'react';
 import { Image as KonvaImage } from 'react-konva';
 import useImage from 'use-image';
+import { renderEditedImage } from '../imageEdits';
+import type { ImageCrop } from '../types';
 
 interface Props {
   id: string;
@@ -20,15 +22,25 @@ interface Props {
   onTransformEnd?: (e: any) => void;
   width?: number;
   height?: number;
+  rotation?: number;
+  flipX?: boolean;
+  flipY?: boolean;
+  crop?: ImageCrop;
 }
 
-const CanvasImage = forwardRef<any, Props>(({ id, x, y, url, draggable, onPointerDown, onDragStart, onDragMove, onDragEnd, onTransformEnd, width: storedWidth, height: storedHeight }, ref) => {
+const CanvasImage = forwardRef<any, Props>(({ id, x, y, url, draggable, onPointerDown, onDragStart, onDragMove, onDragEnd, onTransformEnd, width: storedWidth, height: storedHeight, rotation, flipX, flipY, crop }, ref) => {
   const [image] = useImage(url);
+  // Rebuild the edited picture only when the image or its edits change.
+  const shown = useMemo(
+    () => image && renderEditedImage(image, { rotation, flipX, flipY, crop }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [image, rotation, flipX, flipY, crop?.x, crop?.y, crop?.width, crop?.height],
+  );
 
-  if (!image) return null;
+  if (!shown) return null;
 
-  const width = storedWidth || image.width;
-  const height = storedHeight || image.height;
+  const width = storedWidth || shown.width;
+  const height = storedHeight || shown.height;
 
   return (
     <KonvaImage
@@ -36,7 +48,7 @@ const CanvasImage = forwardRef<any, Props>(({ id, x, y, url, draggable, onPointe
       id={id}
       x={x}
       y={y}
-      image={image}
+      image={shown}
       width={width}
       height={height}
       draggable={draggable}

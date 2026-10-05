@@ -1,6 +1,13 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
+const cropValidator = v.object({
+  x: v.number(),
+  y: v.number(),
+  width: v.number(),
+  height: v.number(),
+});
+
 const themeValidator = v.object({
   id: v.string(),
   name: v.string(),
@@ -58,6 +65,11 @@ export default defineSchema({
     directed: v.optional(v.boolean()),
     groupId: v.optional(v.string()),
     storageId: v.optional(v.id("_storage")),
+    // Image edits: crop the original, turn it, then mirror it.
+    rotation: v.optional(v.number()),
+    flipX: v.optional(v.boolean()),
+    flipY: v.optional(v.boolean()),
+    crop: v.optional(cropValidator),
   }).index("by_boardId", ["boardId"]),
 
   checkpoints: defineTable({
@@ -97,6 +109,10 @@ export default defineSchema({
         /** Original item id, used to remap topology during restore. */
         sourceId: v.optional(v.string()),
         storageId: v.optional(v.id("_storage")),
+        rotation: v.optional(v.number()),
+        flipX: v.optional(v.boolean()),
+        flipY: v.optional(v.boolean()),
+        crop: v.optional(cropValidator),
       }),
     ),
   }).index("by_boardId", ["boardId"]),
